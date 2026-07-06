@@ -1,0 +1,52 @@
+{
+  "subsystems": [
+    {
+      "subsystem": "nvmf",
+      "config": [
+        {
+          "method": "nvmf_create_transport",
+          "params": {
+            "trtype": "TCP",
+            "io_unit_size": 16384,
+            "max_io_size": 131072,
+            "max_io_qpairs_per_ctrlr": 128,
+            "in_capsule_data_size": 16384,
+            "max_aq_depth": 32
+          }
+        },
+        {
+          "method": "nvmf_create_subsystem",
+          "params": {
+            "nqn": "nqn.2024-07.io.spdk:moe_target",
+            "allow_any_host": true,
+            "serial_number": "MOE00000000000001",
+            "model_number": "MoE FFN Target",
+            "max_namespaces": 1
+          }
+        },
+        {
+          "method": "nvmf_subsystem_add_ns",
+          "params": {
+            "nqn": "nqn.2024-07.io.spdk:moe_target",
+            "namespace": {
+              "nsid": 1,
+              "bdev_name": "moe_bdev_0"
+            }
+          }
+        },
+        {
+          "method": "nvmf_subsystem_add_listener",
+          "params": {
+            "nqn": "nqn.2024-07.io.spdk:moe_target",
+            "listen_address": {
+              "trtype": "TCP",
+              "adrfam": "IPv4",
+              "traddr": "127.0.0.1",
+              "trsvcid": "4420"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
