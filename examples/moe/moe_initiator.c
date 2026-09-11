@@ -209,6 +209,7 @@ main(int argc, char **argv)
 	int rc, first_diff;
 
 	spdk_env_opts_init(&env_opts);
+          env_opts.opts_size = sizeof(env_opts);
 	env_opts.name = "moe_initiator";
 	env_opts.no_huge = true;
 	env_opts.mem_size = 512;
