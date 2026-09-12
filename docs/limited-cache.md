@@ -65,6 +65,27 @@ the original MoE calculation. Linux end-to-end validation remains necessary.
 
 ## Limits
 
+### Linux process and memory inspection
+
+SPDK renames its reactor thread to `reactor_0`. Consequently, `pgrep -x moe_tgt`
+and `ps -C moe_tgt` can return no matches even while the target is alive.
+Use executable-path matching instead, without restarting a working target:
+
+```bash
+set -o pipefail
+bash examples/moe/inspect-target.sh | tee /root/moe-run-logs/cache-memory-before.log
+timeout 600s build/examples/moe_initiator 2>&1 | tee /root/moe-run-logs/cache-memory-check.log
+printf 'initiator exit=%s\n' "${PIPESTATUS[0]}"
+bash examples/moe/inspect-target.sh | tee /root/moe-run-logs/cache-memory-after.log
+```
+
+The script reports every matching target in the current PID namespace, including
+its renamed command, RSS/HWM (kB), and cgroup membership. It also reports visible
+container counters (bytes). A missing match can reflect permissions or a different
+container; it is not proof of an OOM kill. Container historical peaks include the
+reference initiator, file cache and earlier runs, and cannot establish target-only
+memory compliance. Retain the before/after logs and the initiator report.
+
 This prototype assumes a single reactor and serialized requests. Synchronous
 file reads block the reactor; per-expert logging affects timings. File page
 cache counts toward cgroup usage, so reduced RSS is not proof of compliance.
