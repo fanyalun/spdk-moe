@@ -17,6 +17,11 @@
 
 #include "moe_ffn/moe_config.h"
 #include "moe_ffn/swiglu_moe.h"
+#include "moe_ffn/matvec.h"
+#include "moe_ffn/topk.h"
+#include "moe_ffn/softmax.h"
+#include "moe_ffn/swiglu_ffn.h"
+#include "moe_cache.h"
 
 #include "bdev_moe.h"
 
@@ -25,9 +30,7 @@ struct moe_bdev {
 	TAILQ_ENTRY(moe_bdev) link;
 
 	const float *W_router;
-	const float *W_gate[MOE_NUM_EXPERTS];
-	const float *W_up[MOE_NUM_EXPERTS];
-	const float *W_down[MOE_NUM_EXPERTS];
+	struct moe_cache cache;
 
 	float *last_output;
 	bool output_valid;
@@ -64,16 +67,11 @@ static int
 bdev_moe_destruct(void *ctx)
 {
 	struct moe_bdev *moe = ctx;
-	int e;
 
 	TAILQ_REMOVE(&g_moe_bdevs, moe, link);
 
 	free((void *)moe->W_router);
-	for (e = 0; e < moe->num_experts; e++) {
-		free((void *)moe->W_gate[e]);
-		free((void *)moe->W_up[e]);
-		free((void *)moe->W_down[e]);
-	}
+	moe_cache_destroy(&moe->cache);
 	free(moe->last_output);
 	free(moe->bdev.name);
 	free(moe);
@@ -122,14 +120,35 @@ static void
 bdev_moe_handle_vendor(struct moe_bdev *moe, struct spdk_bdev_io *bdev_io,
 		       const void *buf, size_t nbytes)
 {
+	float logits[MOE_NUM_EXPERTS], weights[MOE_TOP_K];
+	float expert_output[MOE_D_MODEL];
+	int indices[MOE_TOP_K];
+	const float *gate, *up, *down;
+	int selected, element, rc;
+
+	moe->output_valid = false;
 	if (nbytes != MOE_INPUT_BYTES) {
 		SPDK_ERRLOG("MoE vendor command data size %zu != %d\n", nbytes, MOE_INPUT_BYTES);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
 
-	swiglu_moe(buf, moe->W_router, moe->W_gate, moe->W_up, moe->W_down,
-		   MOE_NUM_EXPERTS, MOE_TOP_K, MOE_D_MODEL, MOE_D_FF, moe->last_output);
+	matvec_mul(buf, moe->W_router, MOE_D_MODEL, MOE_NUM_EXPERTS, logits);
+	topk_select(logits, MOE_NUM_EXPERTS, MOE_TOP_K, indices, weights);
+	softmax(weights, MOE_TOP_K);
+	memset(moe->last_output, 0, MOE_INPUT_BYTES);
+	for (selected = 0; selected < MOE_TOP_K; selected++) {
+		rc = moe_cache_get(&moe->cache, indices[selected], &gate, &up, &down);
+		if (rc != 0) {
+			SPDK_ERRLOG("MoE expert %d load failed: %d\n", indices[selected], rc);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		swiglu_ffn(buf, gate, up, down, MOE_D_MODEL, MOE_D_FF, expert_output);
+		for (element = 0; element < MOE_D_MODEL; element++) {
+			moe->last_output[element] += weights[selected] * expert_output[element];
+		}
+	}
 	moe->output_valid = true;
 	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 }
@@ -214,18 +233,22 @@ static const struct spdk_bdev_fn_table g_moe_fn_table = {
 };
 
 struct spdk_bdev *
-bdev_moe_create(const char *name, const float *W_router, const float *W_gate[],
-		const float *W_up[], const float *W_down[], int num_experts,
+bdev_moe_create(const char *name, const float *W_router, int cache_slots, int num_experts,
 		int d_model, int d_ff)
 {
 	struct moe_bdev *moe;
-	int e, rc;
+	int rc;
 
 	moe = calloc(1, sizeof(*moe));
-	assert(moe != NULL);
+	if (moe == NULL) {
+		return NULL;
+	}
 
 	moe->bdev.name = strdup(name);
-	assert(moe->bdev.name != NULL);
+	if (moe->bdev.name == NULL) {
+		free(moe);
+		return NULL;
+	}
 	moe->bdev.product_name = "MoE FFN disk";
 	moe->bdev.blocklen = MOE_INPUT_BYTES;
 	moe->bdev.phys_blocklen = MOE_INPUT_BYTES;
@@ -235,20 +258,29 @@ bdev_moe_create(const char *name, const float *W_router, const float *W_gate[],
 	moe->bdev.module = &g_moe_if;
 
 	moe->W_router = W_router;
-	for (e = 0; e < num_experts; e++) {
-		moe->W_gate[e] = W_gate[e];
-		moe->W_up[e] = W_up[e];
-		moe->W_down[e] = W_down[e];
+	rc = moe_cache_init(&moe->cache, cache_slots, d_model, d_ff, MOE_WEIGHT_DIR);
+	if (rc != 0) {
+		free(moe->bdev.name);
+		free(moe);
+		return NULL;
 	}
 	moe->num_experts = num_experts;
 	moe->d_model = d_model;
 	moe->d_ff = d_ff;
 	moe->last_output = malloc(MOE_INPUT_BYTES);
-	assert(moe->last_output != NULL);
+	if (moe->last_output == NULL) {
+		moe_cache_destroy(&moe->cache);
+		free(moe->bdev.name);
+		free(moe);
+		return NULL;
+	}
 
 	rc = spdk_bdev_register(&moe->bdev);
 	if (rc != 0) {
-		bdev_moe_destruct(moe);
+		moe_cache_destroy(&moe->cache);
+		free(moe->last_output);
+		free(moe->bdev.name);
+		free(moe);
 		return NULL;
 	}
 

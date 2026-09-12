@@ -1,5 +1,8 @@
-#include "spdk/stdinc.h"
-#include "spdk/log.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include "moe_cache.h"
 
 static float *load_weight(const char *dir, const char *name, int expert_id,
@@ -8,11 +11,16 @@ static float *load_weight(const char *dir, const char *name, int expert_id,
 	char path[512];
 	FILE *file;
 	float *data;
+	struct stat info;
 
 	snprintf(path, sizeof(path), "%s/%s_%d_%dx%d.bin", dir, name, expert_id,
 		 d_model, d_ff);
 	file = fopen(path, "rb");
 	if (file == NULL) {
+		return NULL;
+	}
+	if (fstat(fileno(file), &info) != 0 || info.st_size != (off_t)(elements * sizeof(float))) {
+		fclose(file);
 		return NULL;
 	}
 	data = malloc(elements * sizeof(*data));
@@ -28,7 +36,7 @@ static float *load_weight(const char *dir, const char *name, int expert_id,
 int moe_cache_init(struct moe_cache *cache, int capacity, int d_model, int d_ff,
 		   const char *weight_dir)
 {
-	if (cache == NULL || capacity <= 0 || d_model <= 0 || d_ff <= 0) {
+	if (cache == NULL || capacity <= 0 || d_model <= 0 || d_ff <= 0 || weight_dir == NULL) {
 		return -EINVAL;
 	}
 	memset(cache, 0, sizeof(*cache));
@@ -51,6 +59,11 @@ int moe_cache_get(struct moe_cache *cache, int expert_id,
 	int victim = -1;
 	int i;
 
+	if (cache == NULL || cache->entries == NULL || cache->capacity <= 0 ||
+	    expert_id < 0 || w_gate == NULL || w_up == NULL || w_down == NULL) {
+		return -EINVAL;
+	}
+
 	for (i = 0; i < cache->capacity; i++) {
 		if (cache->entries[i].valid && cache->entries[i].expert_id == expert_id) {
 			entry = &cache->entries[i];
@@ -66,6 +79,9 @@ int moe_cache_get(struct moe_cache *cache, int expert_id,
 	}
 	if (entry == NULL) {
 		entry = &cache->entries[free_slot >= 0 ? free_slot : victim];
+		if (entry->valid) {
+			fprintf(stderr, "MoE cache evict: expert %d\n", entry->expert_id);
+		}
 		free(entry->w_gate);
 		free(entry->w_up);
 		free(entry->w_down);
@@ -85,12 +101,12 @@ int moe_cache_get(struct moe_cache *cache, int expert_id,
 			free(entry->w_up);
 			free(entry->w_down);
 			memset(entry, 0, sizeof(*entry));
-			return -ENOENT;
+			return -EIO;
 		}
 		entry->valid = true;
-		SPDK_NOTICELOG("MoE cache miss: loaded expert %d\n", expert_id);
+		fprintf(stderr, "MoE cache miss: loaded expert %d\n", expert_id);
 	} else {
-		SPDK_NOTICELOG("MoE cache hit: expert %d\n", expert_id);
+		fprintf(stderr, "MoE cache hit: expert %d\n", expert_id);
 	}
 	entry->last_used = ++cache->clock;
 	*w_gate = entry->w_gate;
@@ -102,7 +118,9 @@ int moe_cache_get(struct moe_cache *cache, int expert_id,
 void moe_cache_destroy(struct moe_cache *cache)
 {
 	int i;
-	if (cache == NULL) return;
+	if (cache == NULL) {
+		return;
+	}
 	for (i = 0; i < cache->capacity; i++) {
 		free(cache->entries[i].w_gate);
 		free(cache->entries[i].w_up);

@@ -5,9 +5,7 @@
 
 struct spdk_bdev *bdev_moe_create(const char *name,
 				   const float *W_router,
-				   const float *W_gate[],
-				   const float *W_up[],
-				   const float *W_down[],
+				   int cache_slots,
 				   int num_experts,
 				   int d_model,
 				   int d_ff);
