@@ -71,6 +71,7 @@ struct file_disk {
 	bool			block_size_override;
 	bool			readonly;
 	bool			fallocate;
+	bool			direct_io;
 };
 
 /* For user space reaping of completions */
@@ -133,6 +134,8 @@ bdev_aio_open(struct file_disk *disk)
 	}
 
 	disk->fd = fd;
+	disk->direct_io = (fcntl(fd, F_GETFL) & O_DIRECT) != 0;
+	SPDK_NOTICELOG("AIO %s direct_io=%s\n", disk->filename, disk->direct_io ? "true" : "false");
 
 #ifdef RWF_NOWAIT
 	/* Some aio operations can block, for example if number outstanding
@@ -779,6 +782,7 @@ bdev_aio_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_bool(w, "readonly", fdisk->readonly);
 
 	spdk_json_write_named_bool(w, "fallocate", fdisk->fallocate);
+	spdk_json_write_named_bool(w, "direct_io", fdisk->direct_io);
 
 	spdk_json_write_object_end(w);
 
