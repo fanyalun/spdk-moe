@@ -9,6 +9,7 @@ static struct spdk_bdev_io_wait_entry *g_wait;
 static bool g_starve;
 static struct { spdk_bdev_io_completion_cb callback; void *arg; } g_pending[16];
 static unsigned g_count, g_done, g_failed;
+static uint64_t g_low, g_high;
 
 int
 spdk_bdev_read(struct spdk_bdev_desc *desc, struct spdk_io_channel *channel, void *buffer,
@@ -18,6 +19,9 @@ spdk_bdev_read(struct spdk_bdev_desc *desc, struct spdk_io_channel *channel, voi
 		return -ENOMEM;
 	}
 	assert(bytes == 4096 && offset % 4096 == 0 && g_count < 16);
+	if (g_high) {
+		assert(offset >= g_low && offset + bytes <= g_high);
+	}
 	memset(buffer, 0x5a, bytes);
 	g_pending[g_count].callback = callback;
 	g_pending[g_count++].arg = arg;
@@ -95,6 +99,46 @@ main(void)
 	atomic_store(&s.removed, true);
 	drain(false);
 	assert(g_done == 3 && g_failed == 2 && !s.active_io);
-	puts("PASS: ENOMEM wait/retry, out-of-order completions, error drain, removal, exactly-once callbacks");
+	atomic_store(&s.removed, false);
+	s.layout.expert_offset = 4096;
+	s.layout.gate_bytes = 8192;
+	s.layout.down_bytes = 4096;
+	s.layout.expert_stride = 32768;
+	for (unsigned matrix = 0; matrix < 3; matrix++) {
+		unsigned length = matrix == 2 ? 4096 : 8192;
+		g_low = 4096 + matrix * 8192;
+		g_high = g_low + length;
+		memset(buffer, 0xa5, sizeof(buffer));
+		unsigned before = g_done;
+		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL));
+		drain(false);
+		assert(g_done == before + 1);
+		for (unsigned i = 0; i < sizeof(buffer); i++) {
+			assert(buffer[i] == (i >= 4096 && i < 4096 + length ? 0x5a : 0xa5));
+		}
+		before = g_failed;
+		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL));
+		drain(true);
+		assert(g_failed == before + 1 && !s.active_io);
+		s.io_depth = 1;
+		g_starve = true;
+		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL));
+		assert(g_wait);
+		wait = g_wait;
+		g_wait = NULL;
+		g_starve = false;
+		wait->cb_fn(wait->cb_arg);
+		drain(false);
+		assert(!s.active_io);
+		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL));
+		atomic_store(&s.removed, true);
+		before = g_failed;
+		drain(false);
+		assert(g_failed == before + 1 && !s.active_io);
+		atomic_store(&s.removed, false);
+		s.io_depth = 4;
+	}
+	assert(moe_store_read_matrix(&s, 0, 3, buffer, done, NULL) == -EINVAL);
+	puts("PASS: matrix bounds/canaries/failures, ENOMEM wait/retry, out-of-order completions, error drain, removal, exactly-once callbacks");
 	return 0;
 }

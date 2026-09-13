@@ -32,6 +32,30 @@ def check_layout(image, weights):
                 offset += size
 
 
+def check_matrix_trace(rows, require_overlap=False):
+    early = overlap = False
+    for row in rows:
+        if row['status']:
+            continue
+        events = {(e['selected'], e['stage']): e for e in row['stages']}
+        for (selected, stage), event in events.items():
+            start, end = event['compute_start'], event['compute_end']
+            if not start:
+                continue
+            assert event['read_end'] <= start <= end
+            if stage:
+                assert events[selected, stage - 1]['compute_end'] <= start
+            if stage < 2:
+                assert events[selected, stage + 1]['read_start'] <= start
+            if stage == 0:
+                early |= start < events[selected, 2]['read_end']
+            for other in events.values():
+                if other['selected'] == selected:
+                    overlap |= max(start, other['read_start']) < min(end, other['read_end'])
+    if require_overlap:
+        assert early and overlap, 'expected actual intra-expert overlap under slow I/O'
+
+
 def main():
     root = Path(__file__).resolve().parents[2]
     binary = root / 'test/moe/pipeline/moe_pipeline_test'
@@ -49,15 +73,21 @@ def main():
         with (weights / name).open('wb') as stream:
             data.tofile(stream)
     print(f'artifacts={artifacts}', flush=True)
-    for backend, slots, fault in [('file', 1, ''), ('file', 7, ''), ('aio', 1, ''),
+    cases = [('file', 1, ''), ('file', 7, ''), ('aio', 1, ''),
                                   ('aio', 7, ''), ('aio', 8, ''),
                                   ('aio', 7, 'threads2'), ('aio', 7, 'threads4'),
                                   ('aio', 1, 'threads4'),
                                   ('aio', 6, 'tune'), ('aio', 8, 'large_chunk'),
                                   ('aio', 7, 'truncate'), ('aio', 7, 'remove'),
                                   ('aio', 7, 'slow'), ('aio', 7, 'strict'),
-                                  ('aio', 7, 'short_source')]:
-        label = f'{backend}_{slots}_{fault or "normal"}'
+                                  ('aio', 7, 'bad_gate'), ('aio', 7, 'bad_up'), ('aio', 7, 'bad_down'),
+             ('file', 1, 'matrix_reject'), ('aio', 7, 'bad_pipeline'),
+             ('aio', 7, 'short_source')]
+    for backend, slots, fault, pipeline in [
+        (*case, mode) for case in cases
+        for mode in (['matrix'] if case[2] == 'short_source' else
+                     ['expert', 'matrix'] if case[0] == 'aio' else ['expert'])]:
+        label = f'{backend}_{slots}_{fault or "normal"}_{pipeline}'
         image = artifacts / f'{label}.bin'
         if backend == 'aio':
             with image.open('xb') as stream:
@@ -65,6 +95,7 @@ def main():
         params = dict(name='moe_test', backend=backend, weight_dir=str(weights),
                       d_model=128, d_ff=256, num_experts=9, top_k=8, cache_slots=slots,
                       diagnostics=str(artifacts / f'{label}_stats.jsonl'))
+        params['pipeline'] = pipeline
         params['compute_threads'] = int(fault[-1]) if fault.startswith('threads') else 1
         if fault == 'tune':
             params.update(io_size=256 * 1024, io_depth=16, prefetch=4, compute_threads=4)
@@ -80,6 +111,10 @@ def main():
             config.append(dict(method='bdev_set_qos_limit', params=dict(name='weight_aio', r_mbytes_per_sec=1)))
         if fault == 'strict':
             params['backend'] = 'nvme'
+        if fault == 'matrix_reject':
+            params['pipeline'] = 'matrix'
+        if fault == 'bad_pipeline':
+            params['pipeline'] = 'invalid'
         if fault == 'short_source':
             (weights / 'W_gate_0_128x256.bin').write_bytes(b'\0' * 4)
         config.append(dict(method='bdev_moe_create', params=params))
@@ -89,6 +124,9 @@ def main():
         environment = dict(os.environ, MOE_TEST_WEIGHTS=str(weights))
         if slots == 8:
             environment['MOE_TEST_REPEAT_INPUT'] = '1'
+        if fault in ('bad_gate', 'bad_up', 'bad_down'):
+            environment['MOE_TEST_BAD_IMAGE'] = str(image)
+            environment['MOE_TEST_BAD_MATRIX'] = str(['bad_gate', 'bad_up', 'bad_down'].index(fault))
         if fault == 'truncate':
             environment['MOE_TEST_TRUNCATE'] = str(image)
         elif fault == 'remove':
@@ -96,20 +134,23 @@ def main():
         elif fault == 'slow':
             environment['MOE_TEST_SLOW'] = '1'
         with log.open('w') as output:
-            run = subprocess.run([str(binary), '-c', str(config_path), '-m', '0x1',
+            run = subprocess.run([str(binary), '-c', str(config_path), '-m', environment.get('MOE_TEST_REACTOR_MASK', '0x1'),
                                   '-r', str(artifacts / 'rpc.sock')],
                                  env=environment,
                                  stdout=output, stderr=subprocess.STDOUT, timeout=60)
         print(f'{label} exit={run.returncode} log={log}', flush=True)
-        if bool(run.returncode) != (fault in ('strict', 'short_source')):
+        if bool(run.returncode) != (fault in ('strict', 'short_source', 'matrix_reject', 'bad_pipeline')):
             print(log.read_text()[-10000:])
             return 1
-        if backend == 'aio' and fault not in ('truncate', 'strict', 'short_source'):
+        if backend == 'aio' and fault not in ('truncate', 'strict', 'short_source', 'bad_pipeline'):
             check_layout(image, weights)
         if fault == 'short_source':
             with image.open('rb') as stream:
                 header = struct.unpack('<Q6I7Q', stream.read(88))
             assert header[2] == 0, 'failed import must remain incomplete'
+        if pipeline == 'matrix' and not run.returncode:
+            rows = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
+            check_matrix_trace(rows, require_overlap=fault == 'slow')
         if slots == 8 and not run.returncode:
             stats = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
             assert stats[1]['cache_hits_total'] == 8, 'repeated input must fully hit eight cached experts'

@@ -33,6 +33,9 @@ static float g_expected[D];
 static float *g_router;
 static const char *g_directory;
 static int g_round;
+static int g_first_expert, g_bad_fd = -1;
+static off_t g_bad_offset;
+static float g_original_weight;
 static bool g_removed;
 static bool g_failure_expected;
 static struct spdk_poller *g_remove_poller;
@@ -70,6 +73,7 @@ compute_expected(void)
 	int indices[K];
 	reference_matvec_mul(g_input, g_router, D, N, logits);
 	reference_topk_select(logits, N, K, indices, weights);
+	g_first_expert = indices[0];
 	reference_softmax(weights, K);
 	memset(g_expected, 0, sizeof(g_expected));
 	for (int k = 0; k < K; k++) {
@@ -97,6 +101,21 @@ static void
 read_done(struct spdk_bdev_io *io, bool success, void *arg)
 {
 	spdk_bdev_free_io(io);
+	if (g_failure_expected && g_bad_fd >= 0) {
+		bool restored = pwrite(g_bad_fd, &g_original_weight, sizeof(float), g_bad_offset) == sizeof(float);
+		restored = restored && fsync(g_bad_fd) == 0;
+		close(g_bad_fd);
+		g_bad_fd = -1;
+		unsetenv("MOE_TEST_BAD_IMAGE");
+		if (success || !restored) {
+			finish(1);
+			return;
+		}
+		g_failure_expected = false;
+		puts("retry_after_invalid_matrix=1");
+		send_request();
+		return;
+	}
 	if (g_round >= 32 || g_failure_expected) {
 		printf("invalid_output_read_failed=%d\n", !success);
 		finish(success ? 1 : 0);
@@ -186,6 +205,23 @@ send_request(void)
 			finish(1);
 			return;
 		}
+	}
+	if (g_round == 0 && getenv("MOE_TEST_BAD_IMAGE")) {
+		uint64_t header[11];
+		float invalid = NAN;
+		unsigned matrix = (unsigned)atoi(getenv("MOE_TEST_BAD_MATRIX"));
+		g_bad_fd = open(getenv("MOE_TEST_BAD_IMAGE"), O_RDWR);
+		if (g_bad_fd < 0 || pread(g_bad_fd, header, sizeof(header), 0) != sizeof(header)) {
+			finish(1);
+			return;
+		}
+		g_bad_offset = header[6] + g_first_expert * header[7] + matrix * header[8];
+		if (pread(g_bad_fd, &g_original_weight, sizeof(float), g_bad_offset) != sizeof(float) ||
+		    pwrite(g_bad_fd, &invalid, sizeof(float), g_bad_offset) != sizeof(float) || fsync(g_bad_fd)) {
+			finish(1);
+			return;
+		}
+		g_failure_expected = true;
 	}
 	struct spdk_nvme_cmd cmd = {.opc = 0xc1};
 	if (getenv("MOE_TEST_SLOW") && !g_heartbeat_poller) {

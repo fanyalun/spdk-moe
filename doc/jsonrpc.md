@@ -6474,6 +6474,7 @@ io_size | number | Yes | Application read chunk bytes, default 1048576
 io_depth | number | Yes | Application outstanding I/O limit, default 4, range 1–16
 prefetch | number | Yes | Concurrent expert loads, default 2, range 1–4
 compute_threads | number | Yes | 1, 2 or 4 persistent workers; file backend accepts only 1
+pipeline | string | Yes | `expert` (default) or `matrix`; matrix mode requires AIO/NVMe
 compute_cpu | number | Yes | First worker CPU; other workers use separate physical cores
 diagnostics | string | Yes | Optional JSONL diagnostics file; disabled by default
 d_model | number | Yes | Test dimension, default 2048, positive multiple of 128
