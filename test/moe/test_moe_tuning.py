@@ -20,6 +20,7 @@ def main():
     parser.add_argument('config', type=Path)
     parser.add_argument('--cpu', type=int, default=10)
     parser.add_argument('--count', type=int, default=16)
+    parser.add_argument('--resume', type=Path)
     args = parser.parse_args()
     if args.count < 2 or args.cpu < 0:
         parser.error('count >= 2 and cpu >= 0 required')
@@ -29,18 +30,31 @@ def main():
     opts = [e['params'] for e in entries if e['method'] == 'bdev_moe_create']
     if len(opts) != 1 or opts[0]['backend'] != 'aio':
         parser.error('requires one AIO MoE target with an overwriteable test image')
-    artifacts = Path(tempfile.mkdtemp(prefix='moe_tuning_'))
+    artifacts = args.resume or Path(tempfile.mkdtemp(prefix='moe_tuning_'))
     print(f'artifacts={artifacts}', flush=True)
     manifest = dict(command=os.sys.argv, revision=subprocess.check_output(
         ['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip(), results=[], choices=[])
-    (artifacts / 'source.patch').write_bytes(subprocess.check_output(
-        ['git', '-C', str(root), 'diff', 'HEAD']))
+    if args.resume:
+        manifest = json.loads((artifacts / 'manifest.json').read_text())
+    else:
+        (artifacts / 'source.patch').write_bytes(subprocess.check_output(
+            ['git', '-C', str(root), 'diff', 'HEAD']))
     hashes = {}
+    for result in manifest['results']:
+        for batch in result['batches']:
+            key = (batch['seed'], batch['repeat'], batch['count'])
+            if hashes.setdefault(key, batch['input_digest']) != batch['input_digest']:
+                raise RuntimeError('saved input sequences differ')
 
     def save():
         (artifacts / 'manifest.json').write_text(json.dumps(manifest, indent=2))
 
     def run(label, parameters, count):
+        previous = [x for x in manifest['results'] if x['label'] == label]
+        if previous:
+            if previous[0]['parameters'] != parameters or previous[0]['batches'][0]['count'] != count:
+                raise RuntimeError('resume parameters differ')
+            return previous[0]
         limit = Path('/sys/fs/cgroup/memory.max').read_text().strip()
         used = int(Path('/sys/fs/cgroup/memory.current').read_text())
         if limit != 'max' and used + 2200 * 1024**2 > int(limit):
@@ -49,7 +63,7 @@ def main():
         for subsystem in current['subsystems']:
             for entry in subsystem['config']:
                 if entry['method'] == 'bdev_moe_create':
-                    entry['params'].update(parameters)
+                    entry['params'].update({k: v for k, v in parameters.items() if k != 'memory_mb'})
                     entry['params'].pop('diagnostics', None)
         path = artifacts / f'{label}.json'
         path.write_text(json.dumps(current, indent=2))
@@ -59,7 +73,7 @@ def main():
         print(f'start={label} params={parameters}', flush=True)
         with (artifacts / f'{label}_target.log').open('w') as log:
             target = subprocess.Popen([str(root / 'build/examples/moe_tgt'), '--no-huge',
-                                       '--no-pci', '-s', '1536', '-m', '0x1',
+                                       '--no-pci', '-s', str(parameters.get('memory_mb', 1536)), '-m', '0x1',
                                        '-c', str(path), '-r', sock], stdout=log,
                                       stderr=subprocess.STDOUT)
 
@@ -158,7 +172,11 @@ def main():
         anchor = best.copy()
         for value in values:
             candidate = dict(anchor, **{key: value})
-            candidates.append(run(f'{stage}_{value}', candidate, args.count))
+            label = f'{stage}_{value}'
+            if key == 'cache_slots' and value == 8:
+                candidate['memory_mb'] = 1664
+                label += '_pool1664'
+            candidates.append(run(label, candidate, args.count))
         eligible = [x for x in candidates if x['rss_peak_kib'] < 1800 * 1024
                     and x['max_ms'] <= current['max_ms'] * 1.02]
         winner = min(eligible, key=lambda x: x['mean_ms']) if eligible else current
