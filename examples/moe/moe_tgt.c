@@ -29,16 +29,15 @@ main(int argc, char **argv)
 
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "moe_tgt";
-	opts.no_huge = true;
-	opts.mem_size = 512;
+	opts.mem_size = 1536;
 
-	if (argc == 2) {
+	if (argc == 2 && argv[1][0] != '-') {
 		opts.json_config_file = argv[1];
-	} else if (argc > 2) {
-		fprintf(stderr, "用法: %s [moe_tgt.json]\n", argv[0]);
-		return 1;
 	} else {
-		opts.json_config_file = "moe_tgt.json";
+		rc = spdk_app_parse_args(argc, argv, &opts, NULL, NULL, NULL, NULL);
+		if (rc != SPDK_APP_PARSE_ARGS_SUCCESS) {
+			return rc == SPDK_APP_PARSE_ARGS_HELP ? 0 : 1;
+		}
 	}
 
 	rc = spdk_app_start(&opts, moe_tgt_started, NULL);

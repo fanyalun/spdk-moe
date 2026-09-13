@@ -11,6 +11,7 @@ from io import IOBase as io
 from . import accel
 from . import app
 from . import bdev
+from . import moe
 from . import blobfs
 from . import compressdev
 from . import fsdev

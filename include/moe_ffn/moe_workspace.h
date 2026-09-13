@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #ifndef MOE_WORKSPACE_H
 #define MOE_WORKSPACE_H
 

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include "moe_workspace.h"
 #include "silu.h"
 #include "softmax.h"
@@ -27,7 +29,7 @@ int moe_workspace_init(struct moe_workspace *ws, int d_model, int d_ff,
         moe_workspace_destroy(ws);
         return -ENOMEM;
     }
-    // Touch every allocated page before accepting requests.
+    /* Touch every allocated page before accepting requests. */
     memset(ws->storage, 0, (size_t)count * sizeof(float));
     memset(ws->indices, 0, (size_t)top_k * sizeof(int));
     ws->d_model = d_model;

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include "topk.h"
 
 void topk_select(const float *values, int n, int k, int *indices, float *out_values)
@@ -8,7 +10,7 @@ void topk_select(const float *values, int n, int k, int *indices, float *out_val
     }
     for (int i = 0; i < n; i++) {
         int pos = i < count ? i : count;
-        // Strict comparison preserves the original index order for equal scores.
+        /* Strict comparison preserves the original index order for equal scores. */
         while (pos > 0 && out_values[pos - 1] < values[i]) {
             if (pos < count) {
                 out_values[pos] = out_values[pos - 1];

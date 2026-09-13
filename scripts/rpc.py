@@ -1221,6 +1221,32 @@ def main():
     p.add_argument('name', help='iSCSI bdev name')
     p.set_defaults(func=bdev_iscsi_delete)
 
+    def bdev_moe_create(args):
+        options = {key: getattr(args, key) for key in (
+            'base_bdev', 'weight_dir', 'kernel', 'diagnostics', 'd_model', 'd_ff',
+            'num_experts', 'top_k', 'cache_slots', 'io_size', 'io_depth', 'prefetch',
+            'compute_cpu', 'compute_threads')}
+        print_json(rpc.moe.bdev_moe_create(args.client, args.name, args.backend, **options))
+
+    p = subparsers.add_parser('bdev_moe_create', help='Import weights and create an MoE offload bdev')
+    p.add_argument('name', help='MoE bdev name')
+    p.add_argument('--backend', choices=['file', 'aio', 'nvme'], required=True)
+    p.add_argument('--base-bdev', help='AIO or exclusive NVMe weight bdev')
+    p.add_argument('--weight-dir', help='Input FP32 weight directory')
+    p.add_argument('--kernel', choices=['scalar', 'avx2', 'avx512'])
+    p.add_argument('--diagnostics', help='Optional JSONL diagnostics path')
+    for option in ('d-model', 'd-ff', 'num-experts', 'top-k', 'cache-slots', 'io-size',
+                   'io-depth', 'prefetch', 'compute-cpu', 'compute-threads'):
+        p.add_argument('--' + option, type=int)
+    p.set_defaults(func=bdev_moe_create)
+
+    def bdev_moe_delete(args):
+        rpc.moe.bdev_moe_delete(args.client, args.name)
+
+    p = subparsers.add_parser('bdev_moe_delete', help='Drain and delete an MoE offload bdev')
+    p.add_argument('name', help='MoE bdev name')
+    p.set_defaults(func=bdev_moe_delete)
+
     def bdev_passthru_create(args):
         print_json(rpc.bdev.bdev_passthru_create(args.client,
                                                  base_bdev_name=args.base_bdev_name,

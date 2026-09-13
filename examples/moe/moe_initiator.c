@@ -14,7 +14,16 @@
 #include "spdk/string.h"
 
 #include "moe_ffn/moe_config.h"
-#include "moe_ffn/swiglu_moe.h"
+#ifdef MOE_INDEPENDENT_REFERENCE
+#define matvec_mul reference_matvec_mul
+#define topk_select reference_topk_select
+#define softmax reference_softmax
+#define swiglu_ffn reference_swiglu_ffn
+#endif
+#include "moe_ffn/matvec.h"
+#include "moe_ffn/topk.h"
+#include "moe_ffn/softmax.h"
+#include "moe_ffn/swiglu_ffn.h"
 #include "moe_ffn/test_utils.h"
 
 #define MOE_PATH_MAX 512
@@ -22,9 +31,6 @@
 
 struct moe_weights {
 	float *W_router;
-	const float *W_gate[MOE_NUM_EXPERTS];
-	const float *W_up[MOE_NUM_EXPERTS];
-	const float *W_down[MOE_NUM_EXPERTS];
 };
 
 struct moe_completion {
@@ -43,13 +49,20 @@ moe_load_float_file(const char *path, size_t elems)
 	size_t nread;
 
 	fp = fopen(path, "rb");
-	assert(fp != NULL);
+	if (!fp) {
+		return NULL;
+	}
 	data = malloc(elems * sizeof(float));
-	assert(data != NULL);
+	if (!data) {
+		fclose(fp);
+		return NULL;
+	}
 	nread = fread(data, sizeof(float), elems, fp);
-	if (nread != elems) {
+	if (nread != elems || fgetc(fp) != EOF || ferror(fp)) {
 		fprintf(stderr, "failed to read %s\n", path);
-		abort();
+		free(data);
+		fclose(fp);
+		return NULL;
 	}
 	fclose(fp);
 	return data;
@@ -69,30 +82,48 @@ static void
 moe_load_weights(struct moe_weights *weights)
 {
 	char path[MOE_PATH_MAX];
-	int e;
 
 	snprintf(path, sizeof(path), "%s/W_router_%dx%d.bin",
 		 MOE_WEIGHT_DIR, MOE_D_MODEL, MOE_ROUTER_COLS);
 	weights->W_router = moe_load_float_file(path, MOE_ROUTER_ELEMS);
 
-	for (e = 0; e < MOE_NUM_EXPERTS; e++) {
-		weights->W_gate[e] = moe_load_expert_weight("W_gate", e, MOE_EXPERT_ELEMS);
-		weights->W_up[e] = moe_load_expert_weight("W_up", e, MOE_EXPERT_ELEMS);
-		weights->W_down[e] = moe_load_expert_weight("W_down", e, MOE_DOWN_ELEMS);
-	}
 }
 
 static void
 moe_free_weights(struct moe_weights *weights)
 {
-	int e;
-
 	free(weights->W_router);
-	for (e = 0; e < MOE_NUM_EXPERTS; e++) {
-		free((void *)weights->W_gate[e]);
-		free((void *)weights->W_up[e]);
-		free((void *)weights->W_down[e]);
+}
+
+static int
+moe_compute_expected(const float *input, const float *router, float *output)
+{
+	float logits[MOE_NUM_EXPERTS], weights[MOE_TOP_K], expert[MOE_D_MODEL];
+	int indices[MOE_TOP_K];
+
+	matvec_mul(input, router, MOE_D_MODEL, MOE_NUM_EXPERTS, logits);
+	topk_select(logits, MOE_NUM_EXPERTS, MOE_TOP_K, indices, weights);
+	softmax(weights, MOE_TOP_K);
+	memset(output, 0, MOE_INPUT_BYTES);
+	for (int k = 0; k < MOE_TOP_K; k++) {
+		float *gate = moe_load_expert_weight("W_gate", indices[k], MOE_EXPERT_ELEMS);
+		float *up = moe_load_expert_weight("W_up", indices[k], MOE_EXPERT_ELEMS);
+		float *down = moe_load_expert_weight("W_down", indices[k], MOE_DOWN_ELEMS);
+		if (!gate || !up || !down) {
+			free(gate);
+			free(up);
+			free(down);
+			return -EIO;
+		}
+		swiglu_ffn(input, gate, up, down, MOE_D_MODEL, MOE_D_FF, expert);
+		free(gate);
+		free(up);
+		free(down);
+		for (int j = 0; j < MOE_D_MODEL; j++) {
+			output[j] = fmaf(weights[k], expert[j], output[j]);
+		}
 	}
+	return 0;
 }
 
 static void
@@ -204,25 +235,37 @@ main(int argc, char **argv)
 	struct spdk_nvme_cmd cmd = {};
 	struct moe_completion completion;
 	struct moe_weights weights = {};
-	float *input, *output, *expected;
+	float *input = NULL, *output = NULL, *expected = NULL;
 	float err;
 	int rc, first_diff;
 
 	spdk_env_opts_init(&env_opts);
-          env_opts.opts_size = sizeof(env_opts);
+	env_opts.opts_size = sizeof(env_opts);
 	env_opts.name = "moe_initiator";
 	env_opts.no_huge = true;
 	env_opts.mem_size = 512;
+	env_opts.no_pci = true;
+	env_opts.core_mask = getenv("MOE_INITIATOR_CPU_MASK");
+	if (!env_opts.core_mask) {
+		env_opts.core_mask = "0x4";
+	}
 	if (spdk_env_init(&env_opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
 		return 1;
 	}
 
 	moe_load_weights(&weights);
+	if (!weights.W_router) {
+		rc = 1;
+		goto out;
+	}
 	input = spdk_zmalloc(MOE_INPUT_BYTES, 0x1000, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 	output = spdk_zmalloc(MOE_INPUT_BYTES, 0x1000, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 	expected = malloc(MOE_INPUT_BYTES);
-	assert(input != NULL && output != NULL && expected != NULL);
+	if (!input || !output || !expected) {
+		rc = 1;
+		goto out;
+	}
 	moe_fill_input(input);
 
 	spdk_nvme_trid_populate_transport(&trid, SPDK_NVME_TRANSPORT_TCP);
@@ -265,8 +308,10 @@ main(int argc, char **argv)
 		goto qpair_out;
 	}
 
-	swiglu_moe(input, weights.W_router, weights.W_gate, weights.W_up, weights.W_down,
-		   MOE_NUM_EXPERTS, MOE_TOP_K, MOE_D_MODEL, MOE_D_FF, expected);
+	if (moe_compute_expected(input, weights.W_router, expected)) {
+		rc = 1;
+		goto qpair_out;
+	}
 	err = max_abs_error(output, expected, MOE_D_MODEL, &first_diff);
 
 	printf("============================================================\n");

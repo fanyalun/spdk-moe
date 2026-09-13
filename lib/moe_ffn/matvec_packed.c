@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include "matvec_packed.h"
 #include <math.h>
 #include <stdint.h>
@@ -84,6 +86,9 @@ int matvec_pack(const float *row, int in_dim, int out_dim, float *packed)
     return 0;
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-tree-vectorize")))
+#endif
 static void scalar_block(const float *x, const float *w, int rows, size_t stride,
                          int width, float *y)
 {

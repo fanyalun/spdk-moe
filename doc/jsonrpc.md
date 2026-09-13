@@ -6456,6 +6456,46 @@ Example response:
 }
 ~~~
 
+### bdev_moe_create {#rpc_bdev_moe_create}
+
+Create an FP32 MoE offload bdev. For AIO and NVMe, the RPC completes only after importing
+the current input weights, flushing the data, and flushing the completed layout header.
+Every creation imports again; existing storage contents are not reused.
+
+Name | Type | Optional | Description
+---- | ---- | -------- | -----------
+name | string | No | MoE bdev name
+backend | string | No | `file` for debugging, `aio` for file simulation, or strict `nvme`
+base_bdev | string | Yes | Required for aio/nvme; the base must already exist
+weight_dir | string | Yes | Input directory, default `/tmp/moe_weights`
+kernel | string | Yes | scalar, avx2, or avx512; default AVX2 when supported
+cache_slots | number | Yes | Fixed expert buffers, default 7, range 1–8 subject to memory admission
+io_size | number | Yes | Application read chunk bytes, default 1048576
+io_depth | number | Yes | Application outstanding I/O limit, default 4, range 1–16
+prefetch | number | Yes | Concurrent expert loads, default 2, range 1–4
+compute_threads | number | Yes | 1, 2 or 4 persistent workers; file backend accepts only 1
+compute_cpu | number | Yes | First worker CPU; other workers use separate physical cores
+diagnostics | string | Yes | Optional JSONL diagnostics file; disabled by default
+d_model | number | Yes | Test dimension, default 2048, positive multiple of 128
+d_ff | number | Yes | Test FFN dimension, default 7168
+num_experts | number | Yes | Test expert count, default 256
+top_k | number | Yes | Selected experts, default 8, maximum 8
+
+The result is the new bdev name. Unsupported hardware, insufficient capacity/memory,
+invalid or incomplete weights, and I/O failures return errors. NVMe mode refuses non-NVMe
+bdevs. Buffers belong to the configured SPDK DMA pool; the RPC does not enlarge it.
+See `docs/moe/async_store.md` for memory accounting and configuration examples.
+
+### bdev_moe_delete {#rpc_bdev_moe_delete}
+
+Unregister a MoE bdev and release its resources after outstanding requests drain.
+
+Name | Type | Optional | Description
+---- | ---- | -------- | -----------
+name | string | No | MoE bdev name
+
+Returns `true` after removal, or an error if the bdev cannot be removed.
+
 ### bdev_passthru_create {#rpc_bdev_passthru_create}
 
 Create passthru bdev. This bdev type redirects all IO to it's base bdev. It has no other purpose than being an example

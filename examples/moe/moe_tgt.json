@@ -1,6 +1,24 @@
 {
   "subsystems": [
     {
+      "subsystem": "bdev",
+      "config": [
+        {
+          "method": "bdev_set_options",
+          "params": {"bdev_io_pool_size": 4096, "bdev_io_cache_size": 128}
+        },
+        {
+          "method": "bdev_moe_create",
+          "params": {
+            "name": "moe_bdev_0",
+            "backend": "file",
+            "weight_dir": "/tmp/moe_weights",
+            "cache_slots": 7
+          }
+        }
+      ]
+    },
+    {
       "subsystem": "nvmf",
       "config": [
         {
