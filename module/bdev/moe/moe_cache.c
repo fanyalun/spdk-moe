@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,127 +7,167 @@
 #include <sys/stat.h>
 #include "moe_cache.h"
 
-static float *load_weight(const char *dir, const char *name, int expert_id,
-			  int d_model, int d_ff, size_t elements)
+int
+moe_cache_init_buffers(struct moe_cache *c, int capacity, int d, int h,
+		       const char *directory, size_t gate_bytes, size_t buffer_bytes,
+		       void *(*allocate)(size_t), void (*release)(void *))
 {
-	char path[512];
-	FILE *file;
-	float *data;
-	struct stat info;
-
-	snprintf(path, sizeof(path), "%s/%s_%d_%dx%d.bin", dir, name, expert_id,
-		 d_model, d_ff);
-	file = fopen(path, "rb");
-	if (file == NULL) {
-		return NULL;
-	}
-	if (fstat(fileno(file), &info) != 0 || info.st_size != (off_t)(elements * sizeof(float))) {
-		fclose(file);
-		return NULL;
-	}
-	data = malloc(elements * sizeof(*data));
-	if (data == NULL || fread(data, sizeof(*data), elements, file) != elements) {
-		free(data);
-		fclose(file);
-		return NULL;
-	}
-	fclose(file);
-	return data;
-}
-
-int moe_cache_init(struct moe_cache *cache, int capacity, int d_model, int d_ff,
-		   const char *weight_dir)
-{
-	if (cache == NULL || capacity <= 0 || d_model <= 0 || d_ff <= 0 || weight_dir == NULL) {
+	if (!c || capacity <= 0 || d <= 0 || h <= 0 || !directory || !allocate || !release ||
+	    !gate_bytes || gate_bytes > SIZE_MAX / 2 || buffer_bytes <= 2 * gate_bytes ||
+	    (size_t)capacity > SIZE_MAX / buffer_bytes) {
 		return -EINVAL;
 	}
-	memset(cache, 0, sizeof(*cache));
-	cache->entries = calloc((size_t)capacity, sizeof(*cache->entries));
-	if (cache->entries == NULL) {
+	memset(c, 0, sizeof(*c));
+	c->entries = calloc(capacity, sizeof(*c->entries));
+	if (!c->entries) {
 		return -ENOMEM;
 	}
-	cache->capacity = capacity;
-	cache->d_model = d_model;
-	cache->d_ff = d_ff;
-	cache->weight_dir = weight_dir;
+	c->capacity = capacity;
+	c->d_model = d;
+	c->d_ff = h;
+	c->weight_dir = directory;
+	c->buffer_bytes = buffer_bytes;
+	c->release = release;
+	for (int i = 0; i < capacity; i++) {
+		struct moe_cache_entry *e = &c->entries[i];
+		e->buffer = allocate(buffer_bytes);
+		if (!e->buffer) {
+			moe_cache_destroy(c);
+			return -ENOMEM;
+		}
+		memset(e->buffer, 0, buffer_bytes);
+		e->w_gate = e->buffer;
+		e->w_up = (float *)((char *)e->buffer + gate_bytes);
+		e->w_down = (float *)((char *)e->buffer + 2 * gate_bytes);
+		e->expert_id = -1;
+	}
 	return 0;
 }
 
-int moe_cache_get(struct moe_cache *cache, int expert_id,
-		  const float **w_gate, const float **w_up, const float **w_down)
+int
+moe_cache_init(struct moe_cache *c, int capacity, int d, int h, const char *directory)
 {
-	struct moe_cache_entry *entry = NULL;
-	int free_slot = -1;
-	int victim = -1;
-	int i;
-
-	if (cache == NULL || cache->entries == NULL || cache->capacity <= 0 ||
-	    expert_id < 0 || w_gate == NULL || w_up == NULL || w_down == NULL) {
+	if (d <= 0 || h <= 0 || (size_t)d > SIZE_MAX / sizeof(float) / (size_t)h / 3) {
 		return -EINVAL;
 	}
+	size_t bytes = (size_t)d * h * sizeof(float);
+	return moe_cache_init_buffers(c, capacity, d, h, directory, bytes, 3 * bytes, malloc, free);
+}
 
-	for (i = 0; i < cache->capacity; i++) {
-		if (cache->entries[i].valid && cache->entries[i].expert_id == expert_id) {
-			entry = &cache->entries[i];
+int
+moe_cache_find(struct moe_cache *c, int expert_id)
+{
+	for (int i = 0; i < c->capacity; i++) {
+		if (c->entries[i].state == MOE_CACHE_READY && c->entries[i].expert_id == expert_id) {
+			c->hits++;
+			c->entries[i].last_used = ++c->clock;
+			return i;
+		}
+	}
+	return -1;
+}
+
+int
+moe_cache_reserve(struct moe_cache *c, int expert_id)
+{
+	int victim = -1;
+	for (int i = 0; i < c->capacity; i++) {
+		struct moe_cache_entry *e = &c->entries[i];
+		if (e->refs || e->state == MOE_CACHE_LOADING || e->state == MOE_CACHE_IN_USE) {
+			continue;
+		}
+		if (e->state == MOE_CACHE_EMPTY) {
+			victim = i;
 			break;
 		}
-		if (!cache->entries[i].valid && free_slot < 0) {
-			free_slot = i;
-		}
-		if (cache->entries[i].valid &&
-		    (victim < 0 || cache->entries[i].last_used < cache->entries[victim].last_used)) {
+		if (victim < 0 || e->last_used < c->entries[victim].last_used) {
 			victim = i;
 		}
 	}
-	if (entry == NULL) {
-		entry = &cache->entries[free_slot >= 0 ? free_slot : victim];
-		if (entry->valid) {
-			fprintf(stderr, "MoE cache evict: expert %d\n", entry->expert_id);
+	if (victim >= 0) {
+		struct moe_cache_entry *e = &c->entries[victim];
+		c->misses++;
+		c->evictions += e->state == MOE_CACHE_READY;
+		e->state = MOE_CACHE_LOADING;
+		e->expert_id = expert_id;
+		e->refs = 1;
+		e->last_used = ++c->clock;
+	}
+	return victim;
+}
+
+int
+moe_cache_load_file(struct moe_cache *c, int slot)
+{
+	struct moe_cache_entry *e = &c->entries[slot];
+	const char *names[] = {"W_gate", "W_up", "W_down"};
+	float *buffers[] = {e->w_gate, e->w_up, e->w_down};
+	size_t elements = (size_t)c->d_model * c->d_ff;
+	char path[4096];
+
+	for (int m = 0; m < 3; m++) {
+		struct stat st;
+		int n = snprintf(path, sizeof(path), "%s/%s_%d_%dx%d.bin", c->weight_dir, names[m],
+				 e->expert_id, c->d_model, c->d_ff);
+		if (n < 0 || (size_t)n >= sizeof(path)) {
+			return -ENAMETOOLONG;
 		}
-		free(entry->w_gate);
-		free(entry->w_up);
-		free(entry->w_down);
-		memset(entry, 0, sizeof(*entry));
-		entry->expert_id = expert_id;
-		entry->w_gate = load_weight(cache->weight_dir, "W_gate", expert_id,
-					    cache->d_model, cache->d_ff,
-					    (size_t)cache->d_model * cache->d_ff);
-		entry->w_up = load_weight(cache->weight_dir, "W_up", expert_id,
-					  cache->d_model, cache->d_ff,
-					  (size_t)cache->d_model * cache->d_ff);
-		entry->w_down = load_weight(cache->weight_dir, "W_down", expert_id,
-					    cache->d_model, cache->d_ff,
-					    (size_t)cache->d_ff * cache->d_model);
-		if (entry->w_gate == NULL || entry->w_up == NULL || entry->w_down == NULL) {
-			free(entry->w_gate);
-			free(entry->w_up);
-			free(entry->w_down);
-			memset(entry, 0, sizeof(*entry));
+		FILE *f = fopen(path, "rb");
+		if (!f) {
+			return -errno;
+		}
+		if (fstat(fileno(f), &st) || st.st_size != (off_t)(elements * sizeof(float))) {
+			fclose(f);
+			return -EINVAL;
+		}
+		size_t got = fread(buffers[m], sizeof(float), elements, f);
+		c->read_bytes += got * sizeof(float);
+		int error = ferror(f);
+		fclose(f);
+		if (error || got != elements) {
 			return -EIO;
 		}
-		entry->valid = true;
-		fprintf(stderr, "MoE cache miss: loaded expert %d\n", expert_id);
-	} else {
-		fprintf(stderr, "MoE cache hit: expert %d\n", expert_id);
 	}
-	entry->last_used = ++cache->clock;
-	*w_gate = entry->w_gate;
-	*w_up = entry->w_up;
-	*w_down = entry->w_down;
 	return 0;
 }
 
-void moe_cache_destroy(struct moe_cache *cache)
+int
+moe_cache_get(struct moe_cache *c, int expert_id,
+	      const float **gate, const float **up, const float **down)
 {
-	int i;
-	if (cache == NULL) {
+	if (!c || !c->entries || expert_id < 0 || !gate || !up || !down) {
+		return -EINVAL;
+	}
+	int slot = moe_cache_find(c, expert_id);
+	if (slot < 0) {
+		slot = moe_cache_reserve(c, expert_id);
+		if (slot < 0) {
+			return -EAGAIN;
+		}
+		int rc = moe_cache_load_file(c, slot);
+		c->entries[slot].refs = 0;
+		c->entries[slot].state = rc ? MOE_CACHE_EMPTY : MOE_CACHE_READY;
+		if (rc) {
+			return rc;
+		}
+	}
+	*gate = c->entries[slot].w_gate;
+	*up = c->entries[slot].w_up;
+	*down = c->entries[slot].w_down;
+	return 0;
+}
+
+void
+moe_cache_destroy(struct moe_cache *c)
+{
+	if (!c) {
 		return;
 	}
-	for (i = 0; i < cache->capacity; i++) {
-		free(cache->entries[i].w_gate);
-		free(cache->entries[i].w_up);
-		free(cache->entries[i].w_down);
+	for (int i = 0; c->entries && i < c->capacity; i++) {
+		if (c->entries[i].buffer) {
+			c->release(c->entries[i].buffer);
+		}
 	}
-	free(cache->entries);
-	memset(cache, 0, sizeof(*cache));
+	free(c->entries);
+	memset(c, 0, sizeof(*c));
 }
