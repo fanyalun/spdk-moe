@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import random
+import signal
+import time
 import subprocess
 import struct
 import sys
@@ -42,7 +44,7 @@ def check_matrix_trace(rows, require_overlap=False):
             start, end = event['compute_start'], event['compute_end']
             if not start:
                 continue
-            assert event['read_end'] <= start <= end
+            assert event['read_start'] <= event['read_submit'] <= event['read_end'] <= start <= end
             if stage:
                 assert events[selected, stage - 1]['compute_end'] <= start
             if stage < 2:
@@ -51,7 +53,7 @@ def check_matrix_trace(rows, require_overlap=False):
                 early |= start < events[selected, 2]['read_end']
             for other in events.values():
                 if other['selected'] == selected:
-                    overlap |= max(start, other['read_start']) < min(end, other['read_end'])
+                    overlap |= bool(other['read_submit']) and max(start, other['read_submit']) < min(end, other['read_end'])
     if require_overlap:
         assert early and overlap, 'expected actual intra-expert overlap under slow I/O'
 
@@ -80,9 +82,14 @@ def main():
                                   ('aio', 6, 'tune'), ('aio', 8, 'large_chunk'),
                                   ('aio', 7, 'truncate'), ('aio', 7, 'remove'),
                                   ('aio', 7, 'slow'), ('aio', 7, 'strict'),
-                                  ('aio', 7, 'bad_gate'), ('aio', 7, 'bad_up'), ('aio', 7, 'bad_down'),
+                                  ('aio', 7, 'shutdown'), ('aio', 7, 'bad_gate'), ('aio', 7, 'bad_up'), ('aio', 7, 'bad_down'),
              ('file', 1, 'matrix_reject'), ('aio', 7, 'bad_pipeline'),
              ('aio', 7, 'short_source')]
+    selected_case = os.environ.get('MOE_TEST_CASE')
+    if selected_case is not None:
+        cases = [case for case in cases if case[2] == selected_case]
+        if not cases:
+            raise ValueError(f'unknown test case: {selected_case}')
     for backend, slots, fault, pipeline in [
         (*case, mode) for case in cases
         for mode in (['matrix'] if case[2] == 'short_source' else
@@ -107,7 +114,7 @@ def main():
             params['base_bdev'] = 'weight_aio'
             config.append(dict(method='bdev_aio_create', params=dict(
                 name='weight_aio', filename=str(image), block_size=512)))
-        if fault == 'slow':
+        if fault in ('slow', 'shutdown'):
             config.append(dict(method='bdev_set_qos_limit', params=dict(name='weight_aio', r_mbytes_per_sec=1)))
         if fault == 'strict':
             params['backend'] = 'nvme'
@@ -127,6 +134,8 @@ def main():
         if fault in ('bad_gate', 'bad_up', 'bad_down'):
             environment['MOE_TEST_BAD_IMAGE'] = str(image)
             environment['MOE_TEST_BAD_MATRIX'] = str(['bad_gate', 'bad_up', 'bad_down'].index(fault))
+        if fault == 'shutdown':
+            environment['MOE_TEST_EXPECT_SHUTDOWN'] = '1'
         if fault == 'truncate':
             environment['MOE_TEST_TRUNCATE'] = str(image)
         elif fault == 'remove':
@@ -134,10 +143,30 @@ def main():
         elif fault == 'slow':
             environment['MOE_TEST_SLOW'] = '1'
         with log.open('w') as output:
-            run = subprocess.run([str(binary), '-c', str(config_path), '-m', environment.get('MOE_TEST_REACTOR_MASK', '0x1'),
-                                  '-r', str(artifacts / 'rpc.sock')],
-                                 env=environment,
-                                 stdout=output, stderr=subprocess.STDOUT, timeout=60)
+            command = [str(binary), '-c', str(config_path), '-m',
+                       environment.get('MOE_TEST_REACTOR_MASK', '0x1'),
+                       '-r', str(artifacts / 'rpc.sock')]
+            if fault == 'shutdown':
+                process = subprocess.Popen(command, env=environment, stdout=output,
+                                           stderr=subprocess.STDOUT)
+                try:
+                    deadline = time.monotonic() + 30
+                    while 'vendor_request_submitted=1' not in log.read_text():
+                        if process.poll() is not None or time.monotonic() > deadline:
+                            raise RuntimeError('shutdown test startup failed')
+                        time.sleep(0.05)
+                    time.sleep(0.3)
+                    process.send_signal(signal.SIGTERM)
+                    rc = process.wait(timeout=30)
+                    assert 'inflight_shutdown_drained=1' in log.read_text()
+                    run = subprocess.CompletedProcess(command, rc)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+            else:
+                run = subprocess.run(command, env=environment, stdout=output,
+                                     stderr=subprocess.STDOUT, timeout=60)
         print(f'{label} exit={run.returncode} log={log}', flush=True)
         if bool(run.returncode) != (fault in ('strict', 'short_source', 'matrix_reject', 'bad_pipeline')):
             print(log.read_text()[-10000:])

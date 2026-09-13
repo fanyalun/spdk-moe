@@ -14,6 +14,7 @@ struct moe_request {
 	bool failed[MOE_REQUEST_MAX_K];
 	int stage[MOE_REQUEST_MAX_K];
 	uint64_t first_compute[MOE_REQUEST_MAX_K];
+	uint64_t read_submit[MOE_REQUEST_MAX_K][3];
 	uint64_t read_start[MOE_REQUEST_MAX_K][3], read_end[MOE_REQUEST_MAX_K][3];
 	uint64_t compute_start[MOE_REQUEST_MAX_K][3], compute_end[MOE_REQUEST_MAX_K][3];
 	int completed, loading, status;

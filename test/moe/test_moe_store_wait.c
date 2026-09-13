@@ -10,6 +10,13 @@ static bool g_starve;
 static struct { spdk_bdev_io_completion_cb callback; void *arg; } g_pending[16];
 static unsigned g_count, g_done, g_failed;
 static uint64_t g_low, g_high;
+static uint64_t g_ticks;
+
+uint64_t
+spdk_get_ticks(void)
+{
+	return ++g_ticks;
+}
 
 int
 spdk_bdev_read(struct spdk_bdev_desc *desc, struct spdk_io_channel *channel, void *buffer,
@@ -110,27 +117,29 @@ main(void)
 		g_high = g_low + length;
 		memset(buffer, 0xa5, sizeof(buffer));
 		unsigned before = g_done;
-		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL));
+		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL, NULL));
 		drain(false);
 		assert(g_done == before + 1);
 		for (unsigned i = 0; i < sizeof(buffer); i++) {
 			assert(buffer[i] == (i >= 4096 && i < 4096 + length ? 0x5a : 0xa5));
 		}
 		before = g_failed;
-		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL));
+		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL, NULL));
 		drain(true);
 		assert(g_failed == before + 1 && !s.active_io);
 		s.io_depth = 1;
 		g_starve = true;
-		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL));
-		assert(g_wait);
+		uint64_t first_submit = UINT64_MAX;
+		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL, &first_submit));
+		assert(g_wait && first_submit == 0);
 		wait = g_wait;
 		g_wait = NULL;
 		g_starve = false;
 		wait->cb_fn(wait->cb_arg);
+		assert(first_submit > 0);
 		drain(false);
 		assert(!s.active_io);
-		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL));
+		assert(!moe_store_read_matrix(&s, 0, matrix, buffer + 4096, done, NULL, NULL));
 		atomic_store(&s.removed, true);
 		before = g_failed;
 		drain(false);
@@ -138,7 +147,7 @@ main(void)
 		atomic_store(&s.removed, false);
 		s.io_depth = 4;
 	}
-	assert(moe_store_read_matrix(&s, 0, 3, buffer, done, NULL) == -EINVAL);
+	assert(moe_store_read_matrix(&s, 0, 3, buffer, done, NULL, NULL) == -EINVAL);
 	puts("PASS: matrix bounds/canaries/failures, ENOMEM wait/retry, out-of-order completions, error drain, removal, exactly-once callbacks");
 	return 0;
 }

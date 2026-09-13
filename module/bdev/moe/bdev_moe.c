@@ -152,9 +152,9 @@ request_finish(struct moe_bdev *moe)
 				}
 				fprintf(moe->diagnostics,
 					"%s{\"selected\":%d,\"stage\":%d,\"read_start\":%" PRIu64
-					",\"read_end\":%" PRIu64 ",\"compute_start\":%" PRIu64
+					",\"read_submit\":%" PRIu64 ",\"read_end\":%" PRIu64 ",\"compute_start\":%" PRIu64
 					",\"compute_end\":%" PRIu64 "}", comma ? "," : "", k, stage,
-					r->read_start[k][stage], r->read_end[k][stage],
+					r->read_start[k][stage], r->read_submit[k][stage], r->read_end[k][stage],
 					r->compute_start[k][stage], r->compute_end[k][stage]);
 				comma = true;
 			}
@@ -485,7 +485,8 @@ matrix_read_next(struct moe_bdev *moe, int k)
 		r->read_start[k][stage] = spdk_get_ticks();
 	}
 	int rc = moe_store_read_matrix(&moe->store, moe->ws.indices[k], stage,
-				       buffer, matrix_loaded, &moe->loads[k]);
+				       buffer, matrix_loaded, &moe->loads[k],
+				       moe->diagnostics ? &r->read_submit[k][stage] : NULL);
 	if (rc) {
 		matrix_loaded(&moe->loads[k], rc);
 	}

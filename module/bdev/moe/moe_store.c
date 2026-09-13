@@ -399,6 +399,9 @@ read_submit(void *arg)
 		op->wait.cb_arg = op;
 		rc = spdk_bdev_queue_io_wait(op->wait.bdev, s->channel, &op->wait);
 	} else if (!rc) {
+		if (r->first_submit_ticks && !*r->first_submit_ticks) {
+			*r->first_submit_ticks = spdk_get_ticks();
+		}
 		op->submitted = true;
 		s->active_io++;
 		s->peak_io = spdk_max(s->peak_io, s->active_io);
@@ -450,7 +453,7 @@ store_pump(struct moe_store *s)
 
 static int
 read_range(struct moe_store *s, int expert, uint64_t offset, uint64_t length,
-           void *buffer, moe_store_done done, void *arg)
+           void *buffer, moe_store_done done, void *arg, uint64_t *first_submit_ticks)
 {
 	if (!s->layout.complete || expert < 0 ||
 	    (uint32_t)expert >= s->layout.experts || atomic_load(&s->removed)) {
@@ -459,10 +462,13 @@ read_range(struct moe_store *s, int expert, uint64_t offset, uint64_t length,
 	for (unsigned t = 0; t < MOE_STORE_MAX_READS; t++) {
 		struct moe_store_read *r = &s->reads[t];
 		if (!r->active) {
+			if (first_submit_ticks) {
+				*first_submit_ticks = 0;
+			}
 			*r = (struct moe_store_read){
 				.store = s, .buffer = buffer, .active = true, .done = done, .arg = arg,
 				.offset = s->layout.expert_offset + (uint64_t)expert * s->layout.expert_stride + offset,
-				.length = length,
+				.length = length, .first_submit_ticks = first_submit_ticks,
 			};
 			store_pump(s);
 			return 0;
@@ -475,19 +481,19 @@ int
 moe_store_read_expert(struct moe_store *s, int expert, void *buffer,
                       moe_store_done done, void *arg)
 {
-	return read_range(s, expert, 0, s->layout.expert_stride, buffer, done, arg);
+	return read_range(s, expert, 0, s->layout.expert_stride, buffer, done, arg, NULL);
 }
 
 int
 moe_store_read_matrix(struct moe_store *s, int expert, unsigned matrix,
-                     void *buffer, moe_store_done done, void *arg)
+                     void *buffer, moe_store_done done, void *arg, uint64_t *first_submit_ticks)
 {
 	if (matrix > 2 || !buffer || !done) {
 		return -EINVAL;
 	}
 	return read_range(s, expert, matrix * s->layout.gate_bytes,
 			  matrix == 2 ? s->layout.down_bytes : s->layout.gate_bytes,
-			  buffer, done, arg);
+			  buffer, done, arg, first_submit_ticks);
 }
 
 void

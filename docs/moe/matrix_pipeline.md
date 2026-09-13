@@ -24,13 +24,13 @@ CLI 对应 `scripts/rpc.py bdev_moe_create ... --pipeline matrix`。修改启动
 
 所有命中在加载 miss 前被引用保护。部分权重槽保持 LOADING，不能命中或被淘汰；计算任务依据单独的矩阵就绪状态执行。只有输出已保存且对应 I/O 全部完成，才释放槽位引用。1 槽位可继续处理 Top-8。
 
-失败、移除和关闭停止提交新阶段，排空活动读取与工作线程后完成请求一次。部分权重槽作废；失败结果不能通过 READ 返回。ENOMEM 沿用 SPDK 等待回调，不在 reactor 忙等。没有引入每请求大块分配。
+失败或设备移除后停止提交新阶段，排空活动读取与工作线程后完成请求一次。部分权重槽作废；失败结果不能通过 READ 返回。常规 SIGTERM 保留 SPDK 的退出流程：撤销服务并等待已接收请求排空，不强制中断计算线程。ENOMEM 沿用 SPDK 等待回调，不在 reactor 忙等。没有引入每请求大块分配。
 
 ## 诊断与验证
 
-现有可关闭 `diagnostics` JSONL 增加 `pipeline`、`first_compute_wait_ticks` 及最多 24 条 `stages` 记录。每条包含 Top-K 位置、阶段号、矩阵读取开始/结束及计算开始/结束 tick。事件在固定请求结构中记录，完成请求时统一输出；正式计时关闭诊断。
+现有可关闭 `diagnostics` JSONL 增加 `pipeline`、`first_compute_wait_ticks` 及最多 24 条 `stages` 记录。每条包含 Top-K 位置、阶段号、读取入队 `read_start`、首个分块成功提交 bdev 的 `read_submit`、读取完成以及计算开始/结束 tick。事件在固定请求结构中记录，完成请求时统一输出；正式计时关闭诊断。
 
-读取区间包括分块排队和等待，不能将它当作 SSD 总线持续传输时间。计算时间戳在工作线程实际执行阶段时记录。整专家快路径不拆分三个阶段时间，`first_compute_wait_ticks` 则覆盖两种模式，表示接收请求到首次专家计算的时间。
+读取区间包括分块排队和等待，不能将它当作 SSD 总线持续传输时间。重叠测试使用 `read_submit` 到读取完成的区间，避免仅凭入队就判定 I/O 已提交；ENOMEM 等待期间不记录成功提交时间。计算时间戳在工作线程实际执行阶段时记录。整专家快路径不拆分三个阶段时间，`first_compute_wait_ticks` 则覆盖两种模式，表示接收请求到首次专家计算的时间。
 
 ```sh
 cmake --build ../MoE-compute/build_accuracy -j4 --target test_accuracy test_spdk_accuracy
@@ -43,6 +43,8 @@ python3 test/moe/test_moe_pipeline.py
 ```
 
 计算测试按阶段跨专家交错执行并与冻结参考比较，覆盖三种内核、两种布局及尾部维度。集成测试覆盖两模式、少槽位、多线程、全命中、淘汰、慢 I/O、读取失败和移除。慢 I/O 用例要求事件证明同一专家内部读算区间重叠，并检查矩阵完成及计算依赖。
+
+SIGTERM 用例等待 vendor 请求已提交的标志，再在慢 I/O 期间发送信号，要求在途请求排空并正常退出；可用 `MOE_TEST_CASE=shutdown python3 test/moe/test_moe_pipeline.py` 单独复核。错误权重用例分别注入 Gate/Up/Down NaN，随后修复镜像并重试，验证失败槽位不会保留为有效缓存。
 
 正式尺寸复用已有 MoE 打包文件，以下命令会重新写入指定文件；仅用于明确授权的测试镜像：
 

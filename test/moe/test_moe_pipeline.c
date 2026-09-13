@@ -133,6 +133,11 @@ read_done(struct spdk_bdev_io *io, bool success, void *arg)
 		max_error = fmaxf(max_error, error);
 	}
 	printf("round=%d success=%d max_error=%.9g\n", g_round, success, max_error);
+	if (g_removed && getenv("MOE_TEST_EXPECT_SHUTDOWN")) {
+		puts("inflight_shutdown_drained=1");
+		finish(0);
+		return;
+	}
 	if (!success || g_removed) {
 		finish(1);
 		return;
@@ -150,6 +155,11 @@ static void
 vendor_done(struct spdk_bdev_io *io, bool success, void *arg)
 {
 	spdk_bdev_free_io(io);
+	if (g_removed && getenv("MOE_TEST_EXPECT_SHUTDOWN")) {
+		puts("inflight_shutdown_drained=1");
+		finish(0);
+		return;
+	}
 	if (success != (g_round < 32 && !g_failure_expected)) {
 		fprintf(stderr, "unexpected vendor status round=%d success=%d\n", g_round, success);
 		finish(1);
@@ -209,7 +219,12 @@ send_request(void)
 	if (g_round == 0 && getenv("MOE_TEST_BAD_IMAGE")) {
 		uint64_t header[11];
 		float invalid = NAN;
-		unsigned matrix = (unsigned)atoi(getenv("MOE_TEST_BAD_MATRIX"));
+		const char *matrix_text = getenv("MOE_TEST_BAD_MATRIX");
+		if (!matrix_text || matrix_text[0] < '0' || matrix_text[0] > '2' || matrix_text[1]) {
+			finish(1);
+			return;
+		}
+		unsigned matrix = (unsigned)(matrix_text[0] - '0');
 		g_bad_fd = open(getenv("MOE_TEST_BAD_IMAGE"), O_RDWR);
 		if (g_bad_fd < 0 || pread(g_bad_fd, header, sizeof(header), 0) != sizeof(header)) {
 			finish(1);
@@ -231,6 +246,9 @@ send_request(void)
 					   D * sizeof(float), vendor_done, NULL);
 	if (rc) {
 		finish(1);
+	} else if (getenv("MOE_TEST_EXPECT_SHUTDOWN")) {
+		puts("vendor_request_submitted=1");
+		fflush(stdout);
 	}
 }
 

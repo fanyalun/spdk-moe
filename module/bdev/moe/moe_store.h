@@ -27,6 +27,7 @@ struct moe_store_read {
 	struct moe_store *store;
 	void *buffer;
 	uint64_t offset, next, length;
+	uint64_t *first_submit_ticks;
 	unsigned outstanding;
 	int status;
 	bool active;
@@ -76,7 +77,7 @@ int moe_store_open(struct moe_store *store, const char *base, const char *direct
 int moe_store_read_expert(struct moe_store *store, int expert, void *buffer,
 			  moe_store_done done, void *arg);
 int moe_store_read_matrix(struct moe_store *store, int expert, unsigned matrix,
-                          void *buffer, moe_store_done done, void *arg);
+                          void *buffer, moe_store_done done, void *arg, uint64_t *first_submit_ticks);
 void moe_store_close(struct moe_store *store);
 
 #endif
