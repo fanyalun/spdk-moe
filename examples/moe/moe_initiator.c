@@ -182,7 +182,7 @@ max_abs_error(const float *a, const float *b, int len, int *first_diff)
 
 	*first_diff = -1;
 	for (i = 0; i < len; i++) {
-		float err = fabsf(a[i] - b[i]);
+		float err = (!isfinite(a[i]) || !isfinite(b[i])) ? INFINITY : fabsf(a[i] - b[i]);
 		if (err > max_err) {
 			max_err = err;
 		}
