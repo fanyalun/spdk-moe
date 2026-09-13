@@ -19,9 +19,10 @@ def main():
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--runtime', type=int, default=60)
     parser.add_argument('--cpu', type=int, default=2)
+    parser.add_argument('--reactor-cpu', type=int, default=0)
     args = parser.parse_args()
-    if args.rounds < 1 or args.runtime < 1:
-        parser.error('rounds and runtime must be positive')
+    if args.rounds < 1 or args.runtime < 1 or not 0 <= args.reactor_cpu < 1024:
+        parser.error('positive rounds/runtime and reactor-cpu in [0, 1024) required')
     root = Path(__file__).resolve().parents[2]
     config = json.loads(args.config.read_text())
     entries = [item for subsystem in config['subsystems'] for item in subsystem['config']]
@@ -54,7 +55,7 @@ def main():
             stop = threading.Event()
             with (artifacts / f'{label}_target.log').open('w') as log:
                 target = subprocess.Popen([str(root / 'build/examples/moe_tgt'), '--no-huge',
-                                           '--no-pci', '-s', '1536', '-m', '0x1',
+                                           '--no-pci', '-s', '1536', '-m', hex(1 << args.reactor_cpu),
                                            '-c', str(path), '-r', sock], stdout=log,
                                           stderr=subprocess.STDOUT)
 

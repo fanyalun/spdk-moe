@@ -12,6 +12,15 @@ test/moe/fixed_bench/moe_fixed_bench 8 42 10 1 /tmp/repeat.jsonl
 
 入口显式设置 SPDK core_mask，并检查初始化后的实际 CPU。原 benchmark 的 `--cpu` 在初始化 SPDK 前调用 sched_setaffinity，但默认 SPDK core_mask 为 0x1，会把线程再次绑定到 CPU 0；仅看报告中的 CPU 参数不足以证明实际绑定。运行未修改的官方 benchmark 时，应将 target reactor 放在其他物理核心，并核对实际线程亲和性。另外，原 run_phase 是先执行再判断截止时间，因此 warmup=0 仍执行一次不计时请求。
 
+固定请求数的输出仅用于开发诊断和候选筛选，不用于引用官方性能成绩。对外端到端性能结论须使用未修改的参考 benchmark，例如本机单计算线程配置：
+
+```sh
+python3 test/moe/test_moe_pipeline_bench.py /path/to/aio_target.json \
+  --rounds 3 --runtime 30 --cpu 0 --reactor-cpu 10
+```
+
+新增 reactor-cpu 只改变 target 的启动核心，不修改参考 benchmark 的计时、统计、连接和输出。上述例子让参考 initiator 使用实际 CPU 0、reactor 使用 CPU 10、单计算线程使用配置指定的 CPU 1。多计算线程可能自动选择 CPU 0，不能直接沿用这个例子而不核对日志。
+
 ## 顺序筛选
 
 ```sh

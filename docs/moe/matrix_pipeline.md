@@ -64,6 +64,6 @@ python3 test/moe/test_moe_pipeline_bench.py /path/to/aio_target.json \
   --rounds 3 --runtime 60 --cpu 2
 ```
 
-该脚本仅接受单个 AIO MoE 的现有 target 配置，交替启动两模式，每轮重新导入同一文件、关闭诊断，调用原 benchmark。固定 seed 42、warmup 0 秒，因此每轮从冷缓存和相同输入序列起点开始；基于时间停止导致实际样本数量可能不同。保存配置、日志、CPU 节流、RSS 和原始 JSON。全命中与其他受控缓存分布的性能仍需单独测量，不能由随机输入结果推断。
+该脚本仅接受单个 AIO MoE 的现有 target 配置，交替启动两模式，每轮重新导入同一文件、关闭诊断，调用原 benchmark。固定 seed 42、warmup 0 秒；target 初始缓存为空，但原 run_phase 仍执行一次不计时请求，因此首个计时请求不是严格全冷。基于时间停止导致实际样本数量可能不同。保存配置、日志、CPU 节流、RSS 和原始 JSON。全命中与其他受控缓存分布的性能仍需单独测量，不能由随机输入结果推断。参考 initiator 的实际 CPU 绑定及 reactor-cpu 参数见 [参数筛选说明](tuning.md)。
 
 `--warmup` 的单位是秒，不是请求数。正式 P99/P99.99、NVMe 与官方内存验收继续遵循原发布门槛。
