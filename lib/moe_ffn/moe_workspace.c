@@ -80,20 +80,37 @@ int moe_route(struct moe_workspace *ws, const float *input, const float *router)
     return finite_vector(ws->weights, ws->top_k);
 }
 
+int moe_expert_stage(struct moe_workspace *ws, enum moe_stage stage,
+                     const float *weight, float *gate, float *up, float *output, int packed)
+{
+    switch (stage) {
+    case MOE_STAGE_GATE:
+        matvec_ordered(ws->input, weight, ws->d_model, ws->d_ff, gate, ws->kernel, packed);
+        return 0;
+    case MOE_STAGE_UP:
+        matvec_ordered(ws->input, weight, ws->d_model, ws->d_ff, up, ws->kernel, packed);
+        for (int i = 0; i < ws->d_ff; i++) {
+            gate[i] = silu(gate[i]) * up[i];
+        }
+        return 0;
+    case MOE_STAGE_DOWN:
+        matvec_ordered(gate, weight, ws->d_ff, ws->d_model, output, ws->kernel, packed);
+        return finite_vector(output, ws->d_model);
+    default:
+        return -EINVAL;
+    }
+}
+
 int moe_expert(struct moe_workspace *ws, const float *gate, const float *up,
                const float *down, int selected, int packed)
 {
     if (selected < 0 || selected >= ws->top_k) {
         return -EINVAL;
     }
-    matvec_ordered(ws->input, gate, ws->d_model, ws->d_ff, ws->gate, ws->kernel, packed);
-    matvec_ordered(ws->input, up, ws->d_model, ws->d_ff, ws->up, ws->kernel, packed);
-    for (int i = 0; i < ws->d_ff; i++) {
-        ws->gate[i] = silu(ws->gate[i]) * ws->up[i];
-    }
     float *output = ws->expert_outputs + (size_t)selected * ws->d_model;
-    matvec_ordered(ws->gate, down, ws->d_ff, ws->d_model, output, ws->kernel, packed);
-    return finite_vector(output, ws->d_model);
+    moe_expert_stage(ws, MOE_STAGE_GATE, gate, ws->gate, ws->up, output, packed);
+    moe_expert_stage(ws, MOE_STAGE_UP, up, ws->gate, ws->up, output, packed);
+    return moe_expert_stage(ws, MOE_STAGE_DOWN, down, ws->gate, ws->up, output, packed);
 }
 
 int moe_combine(struct moe_workspace *ws, float *output)

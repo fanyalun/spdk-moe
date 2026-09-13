@@ -7,7 +7,7 @@
 #include "spdk/bdev_module.h"
 
 struct moe_create_opts {
-	const char *name, *backend, *base_bdev, *weight_dir, *kernel, *diagnostics;
+	const char *name, *backend, *base_bdev, *weight_dir, *kernel, *diagnostics, *pipeline;
 	int d_model, d_ff, num_experts, top_k, cache_slots;
 	unsigned io_size, io_depth, prefetch;
 	int compute_cpu;

@@ -1225,7 +1225,7 @@ def main():
         options = {key: getattr(args, key) for key in (
             'base_bdev', 'weight_dir', 'kernel', 'diagnostics', 'd_model', 'd_ff',
             'num_experts', 'top_k', 'cache_slots', 'io_size', 'io_depth', 'prefetch',
-            'compute_cpu', 'compute_threads')}
+            'compute_cpu', 'compute_threads', 'pipeline')}
         print_json(rpc.moe.bdev_moe_create(args.client, args.name, args.backend, **options))
 
     p = subparsers.add_parser('bdev_moe_create', help='Import weights and create an MoE offload bdev')
@@ -1235,6 +1235,7 @@ def main():
     p.add_argument('--weight-dir', help='Input FP32 weight directory')
     p.add_argument('--kernel', choices=['scalar', 'avx2', 'avx512'])
     p.add_argument('--diagnostics', help='Optional JSONL diagnostics path')
+    p.add_argument('--pipeline', choices=['expert', 'matrix'])
     for option in ('d-model', 'd-ff', 'num-experts', 'top-k', 'cache-slots', 'io-size',
                    'io-depth', 'prefetch', 'compute-cpu', 'compute-threads'):
         p.add_argument('--' + option, type=int)

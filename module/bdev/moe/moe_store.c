@@ -427,19 +427,19 @@ store_pump(struct moe_store *s)
 		if (atomic_load(&s->removed)) {
 			r->status = -ENODEV;
 		}
-		for (unsigned i = 0; !r->status && r->next < s->layout.expert_stride && i < s->io_depth; i++) {
+		for (unsigned i = 0; !r->status && r->next < r->length && i < s->io_depth; i++) {
 			struct moe_store_op *op = &s->ops[i];
 			if (op->read) {
 				continue;
 			}
 			op->read = r;
 			op->offset = r->next;
-			op->length = spdk_min(s->io_size, s->layout.expert_stride - r->next);
+			op->length = spdk_min(s->io_size, r->length - r->next);
 			r->next += op->length;
 			r->outstanding++;
 			read_submit(op);
 		}
-		if ((r->status || r->next == s->layout.expert_stride) && !r->outstanding) {
+		if ((r->status || r->next == r->length) && !r->outstanding) {
 			r->active = false;
 			r->done(r->arg, r->status);
 		}
@@ -448,9 +448,9 @@ store_pump(struct moe_store *s)
 	s->pumping = false;
 }
 
-int
-moe_store_read_expert(struct moe_store *s, int expert, void *buffer,
-		      moe_store_done done, void *arg)
+static int
+read_range(struct moe_store *s, int expert, uint64_t offset, uint64_t length,
+           void *buffer, moe_store_done done, void *arg)
 {
 	if (!s->layout.complete || expert < 0 ||
 	    (uint32_t)expert >= s->layout.experts || atomic_load(&s->removed)) {
@@ -461,13 +461,33 @@ moe_store_read_expert(struct moe_store *s, int expert, void *buffer,
 		if (!r->active) {
 			*r = (struct moe_store_read){
 				.store = s, .buffer = buffer, .active = true, .done = done, .arg = arg,
-				.offset = s->layout.expert_offset + (uint64_t)expert * s->layout.expert_stride,
+				.offset = s->layout.expert_offset + (uint64_t)expert * s->layout.expert_stride + offset,
+				.length = length,
 			};
 			store_pump(s);
 			return 0;
 		}
 	}
 	return -EAGAIN;
+}
+
+int
+moe_store_read_expert(struct moe_store *s, int expert, void *buffer,
+                      moe_store_done done, void *arg)
+{
+	return read_range(s, expert, 0, s->layout.expert_stride, buffer, done, arg);
+}
+
+int
+moe_store_read_matrix(struct moe_store *s, int expert, unsigned matrix,
+                     void *buffer, moe_store_done done, void *arg)
+{
+	if (matrix > 2 || !buffer || !done) {
+		return -EINVAL;
+	}
+	return read_range(s, expert, matrix * s->layout.gate_bytes,
+			  matrix == 2 ? s->layout.down_bytes : s->layout.gate_bytes,
+			  buffer, done, arg);
 }
 
 void

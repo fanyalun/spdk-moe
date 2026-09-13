@@ -16,6 +16,11 @@ int moe_workspace_init(struct moe_workspace *ws, int d_model, int d_ff,
                        int num_experts, int top_k, enum moe_kernel kernel);
 void moe_workspace_destroy(struct moe_workspace *ws);
 int moe_route(struct moe_workspace *ws, const float *input, const float *router);
+enum moe_stage { MOE_STAGE_GATE, MOE_STAGE_UP, MOE_STAGE_DOWN };
+
+int moe_expert_stage(struct moe_workspace *ws, enum moe_stage stage,
+                     const float *weight, float *gate, float *up, float *output, int packed);
+
 int moe_expert(struct moe_workspace *ws, const float *gate, const float *up,
                const float *down, int selected, int packed);
 int moe_combine(struct moe_workspace *ws, float *output);

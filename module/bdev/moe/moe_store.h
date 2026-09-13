@@ -26,7 +26,7 @@ typedef void (*moe_store_done)(void *arg, int status);
 struct moe_store_read {
 	struct moe_store *store;
 	void *buffer;
-	uint64_t offset, next;
+	uint64_t offset, next, length;
 	unsigned outstanding;
 	int status;
 	bool active;
@@ -75,6 +75,8 @@ int moe_store_open(struct moe_store *store, const char *base, const char *direct
 		   unsigned io_depth, moe_store_done ready, void *arg);
 int moe_store_read_expert(struct moe_store *store, int expert, void *buffer,
 			  moe_store_done done, void *arg);
+int moe_store_read_matrix(struct moe_store *store, int expert, unsigned matrix,
+                          void *buffer, moe_store_done done, void *arg);
 void moe_store_close(struct moe_store *store);
 
 #endif

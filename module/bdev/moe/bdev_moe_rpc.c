@@ -21,6 +21,7 @@ static const struct spdk_json_object_decoder create_decoders[] = {
 	DECODER(weight_dir, spdk_json_decode_string, true),
 	DECODER(kernel, spdk_json_decode_string, true),
 	DECODER(diagnostics, spdk_json_decode_string, true),
+	DECODER(pipeline, spdk_json_decode_string, true),
 	DECODER(d_model, spdk_json_decode_int32, true),
 	DECODER(d_ff, spdk_json_decode_int32, true),
 	DECODER(num_experts, spdk_json_decode_int32, true),
@@ -42,6 +43,7 @@ free_create(struct create_rpc *r)
 	free((void *)r->opts.weight_dir);
 	free((void *)r->opts.kernel);
 	free((void *)r->opts.diagnostics);
+	free((void *)r->opts.pipeline);
 	free(r);
 }
 
