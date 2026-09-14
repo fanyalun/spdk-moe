@@ -9,6 +9,7 @@
 #include "spdk/nvme_spec.h"
 #include "moe_ffn/moe_config.h"
 #include "moe_ffn/moe_workspace.h"
+#include "moe_ffn/moe_affinity.h"
 #include "moe_cache.h"
 #include "moe_store.h"
 #include "moe_request.h"
@@ -877,7 +878,8 @@ static const struct spdk_bdev_fn_table g_moe_fn_table = {
 static void *
 dma_allocate(size_t size)
 {
-	return spdk_dma_zmalloc(size, 4096, NULL);
+	return spdk_dma_zmalloc_socket(size, 4096, NULL,
+				      spdk_env_get_numa_id(spdk_env_get_current_core()));
 }
 
 static int
@@ -932,6 +934,10 @@ start_worker(struct moe_bdev *moe, pthread_t *thread, void *(*entry)(void *), vo
 	int rc = EINVAL;
 
 	for (int cpu = 0; cpu < count && cpu < CPU_SETSIZE; cpu++) {
+		if (!moe_affinity_allowed(cpu) ||
+		    ((index > 0 || moe->compute_cpu < 0) && moe_affinity_reserved(cpu))) {
+			continue;
+		}
 		if (index == 0 && moe->compute_cpu >= 0 && cpu != moe->compute_cpu) {
 			continue;
 		}
@@ -967,7 +973,8 @@ start_worker(struct moe_bdev *moe, pthread_t *thread, void *(*entry)(void *), vo
 		pthread_attr_destroy(&attr);
 		if (!rc) {
 			moe->worker_cpus[index] = cpu;
-			SPDK_NOTICELOG("MoE worker=%d compute_cpu=%d reactor_cpu=%d\n", index, cpu, reactor_cpu);
+			SPDK_NOTICELOG("MoE worker=%d compute_cpu=%d reactor_cpu=%d worker_node=%d reactor_node=%d\n",
+				       index, cpu, reactor_cpu, cpu_node(cpu), node);
 			return 0;
 		}
 	}

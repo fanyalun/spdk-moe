@@ -11,8 +11,10 @@
 
 #include "spdk/env.h"
 #include "spdk/event.h"
+#include "spdk/cpuset.h"
 
 #include "moe_ffn/moe_config.h"
+#include "moe_ffn/moe_affinity.h"
 
 static void
 moe_tgt_started(void *arg1)
@@ -25,8 +27,14 @@ int
 main(int argc, char **argv)
 {
 	struct spdk_app_opts opts = {};
+	char default_mask[32];
 	int rc;
 
+	rc = moe_affinity_init();
+	if (rc) {
+		fprintf(stderr, "Cannot capture CPU affinity or invalid MOE_INITIATOR_CPU: %d\n", rc);
+		return 1;
+	}
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "moe_tgt";
 	opts.mem_size = 1536;
@@ -40,6 +48,30 @@ main(int argc, char **argv)
 		}
 	}
 
+	if (!opts.reactor_mask && !opts.lcore_map) {
+		int cpu = opts.main_core >= 0 ? opts.main_core : moe_affinity_default_reactor();
+		if (cpu < 0 || !moe_affinity_allowed(cpu)) {
+			fprintf(stderr, "No default reactor: need two allowed target physical cores "
+				"apart from MOE_INITIATOR_CPU (default 0); specify -m to override\n");
+			return 1;
+		}
+		snprintf(default_mask, sizeof(default_mask), "[%d]", cpu);
+		opts.reactor_mask = default_mask;
+		fprintf(stderr, "MoE default reactor_cpu=%d (startup affinity preserved)\n", cpu);
+	}
+	if (opts.reactor_mask) {
+		struct spdk_cpuset set = {};
+		if (spdk_cpuset_parse(&set, opts.reactor_mask)) {
+			fprintf(stderr, "Invalid reactor CPU mask\n");
+			return 1;
+		}
+		for (uint32_t cpu = 0; cpu < SPDK_CPUSET_SIZE; cpu++) {
+			if (spdk_cpuset_get_cpu(&set, cpu) && !moe_affinity_allowed(cpu)) {
+				fprintf(stderr, "Reactor CPU %u is outside startup affinity\n", cpu);
+				return 1;
+			}
+		}
+	}
 	rc = spdk_app_start(&opts, moe_tgt_started, NULL);
 	spdk_app_fini();
 	return rc;
