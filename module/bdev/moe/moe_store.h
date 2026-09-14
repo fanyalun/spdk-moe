@@ -53,6 +53,7 @@ struct moe_store {
 	uint64_t read_bytes;
 	atomic_bool removed;
 	bool pumping, repump;
+	bool require_direct_source;
 	void (*removed_cb)(void *);
 	void *removed_arg;
 	struct moe_store_read reads[MOE_STORE_MAX_READS];

@@ -131,7 +131,7 @@ import_io(struct moe_store *s, uint64_t offset, uint64_t length, bool flush)
 }
 
 static int
-read_source(const char *path, void *raw, size_t bytes)
+read_source(const char *path, void *raw, size_t bytes, bool require_direct)
 {
 	struct stat st;
 	int fd = open(path, O_RDONLY | O_DIRECT);
@@ -139,6 +139,9 @@ read_source(const char *path, void *raw, size_t bytes)
 	ssize_t count;
 
 	if (fd < 0) {
+		if (require_direct) {
+			return -errno;
+		}
 		direct = false;
 		fd = open(path, O_RDONLY);
 	}
@@ -152,7 +155,7 @@ read_source(const char *path, void *raw, size_t bytes)
 	do {
 		count = pread(fd, raw, align_up(bytes, 4096), 0);
 	} while (count < 0 && errno == EINTR);
-	if (count < 0 && errno == EINVAL && direct) {
+	if (count < 0 && errno == EINVAL && direct && !require_direct) {
 		close(fd);
 		direct = false;
 		fd = open(path, O_RDONLY);
@@ -239,7 +242,7 @@ import_worker(void *arg)
 		rc = -ENAMETOOLONG;
 		goto done;
 	}
-	rc = read_source(path, raw, l->router_bytes);
+	rc = read_source(path, raw, l->router_bytes, s->require_direct_source);
 	if (rc) {
 		goto done;
 	}
@@ -257,7 +260,8 @@ import_worker(void *arg)
 				rc = -ENAMETOOLONG;
 				break;
 			}
-			rc = read_source(path, raw, (uint64_t)l->d_model * l->d_ff * sizeof(float));
+			rc = read_source(path, raw, (uint64_t)l->d_model * l->d_ff * sizeof(float),
+					 s->require_direct_source);
 			if (!rc) {
 				uint64_t bytes = m == 2 ? l->down_bytes : l->gate_bytes;
 				rc = import_matrix(s, raw, m == 2 ? l->d_ff : l->d_model,
@@ -299,6 +303,7 @@ moe_store_open(struct moe_store *s, const char *base, const char *directory,
 	pthread_mutex_init(&s->mutex, NULL);
 	pthread_cond_init(&s->condition, NULL);
 	s->ready = ready;
+	s->require_direct_source = strict_nvme;
 	s->ready_arg = arg;
 	rc = spdk_bdev_open_ext(base, true, base_event, s, &s->desc);
 	if (rc) {

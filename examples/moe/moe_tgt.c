@@ -12,13 +12,35 @@
 #include "spdk/env.h"
 #include "spdk/event.h"
 #include "spdk/cpuset.h"
+#include "spdk/util.h"
 
 #include "moe_ffn/moe_config.h"
 #include "moe_ffn/moe_affinity.h"
+#include "moe_ffn/matvec_packed.h"
 
 static void
 moe_tgt_started(void *arg1)
 {
+	float weights[64 * 64], input[64], output[64];
+	enum moe_kernel kernel;
+	if (moe_kernel_parse(NULL, &kernel)) {
+		spdk_app_stop(-ENOTSUP);
+		return;
+	}
+	for (size_t i = 0; i < SPDK_COUNTOF(weights); i++) {
+		weights[i] = 0.125f;
+	}
+	for (size_t i = 0; i < SPDK_COUNTOF(input); i++) {
+		input[i] = 0.125f;
+	}
+	matvec_ordered(input, weights, 64, 64, output, kernel, 1);
+	for (size_t i = 0; i < SPDK_COUNTOF(output); i++) {
+		if (output[i] != 1.0f) {
+			spdk_app_stop(-EIO);
+			return;
+		}
+	}
+	fprintf(stderr, "MoE warmup: one 64x64 kernel completed; no client requests\n");
 	printf("MoE target started: %s:%d, nqn=%s\n",
 	       MOE_TARGET_ADDR, MOE_TARGET_PORT, MOE_NQN);
 }
