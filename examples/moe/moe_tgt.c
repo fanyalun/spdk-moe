@@ -59,7 +59,6 @@ main(int argc, char **argv)
 	}
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "moe_tgt";
-	opts.mem_size = 1536;
 
 	if (argc == 2 && argv[1][0] != '-') {
 		opts.json_config_file = argv[1];
