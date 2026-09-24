@@ -4,8 +4,8 @@
 /* ===== 维度参数（须与 ffn 侧 moe_config.h 同名宏值一致）===== */
 #define MOE_D_MODEL         2048
 #define MOE_D_FF            7168
-#define MOE_NUM_EXPERTS     8
-#define MOE_TOP_K           2
+#define MOE_NUM_EXPERTS     256
+#define MOE_TOP_K           8
 
 /* ===== 种子 ===== */
 #define MOE_SEED_DEFAULT    42
