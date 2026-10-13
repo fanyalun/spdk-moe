@@ -16,6 +16,7 @@
 
 #include "moe_ffn/moe_config.h"
 #include "moe_ffn/moe_affinity.h"
+#include "moe_hugepages.h"
 
 static void
 moe_tgt_started(void *arg1)
@@ -29,6 +30,7 @@ main(int argc, char **argv)
 {
 	struct spdk_app_opts opts = {};
 	char default_mask[32];
+	char *env_context = NULL, *hugedir = NULL;
 	int rc;
 
 	rc = moe_affinity_init();
@@ -38,6 +40,7 @@ main(int argc, char **argv)
 	}
 	spdk_app_opts_init(&opts, sizeof(opts));
 	opts.name = "moe_tgt";
+	opts.mem_size = MOE_DEFAULT_MEM_MIB;
 
 	if (argc == 2 && argv[1][0] != '-') {
 		opts.json_config_file = argv[1];
@@ -72,7 +75,12 @@ main(int argc, char **argv)
 			}
 		}
 	}
-	rc = spdk_app_start(&opts, moe_tgt_started, NULL);
-	spdk_app_fini();
+	rc = moe_hugepages_prepare(&opts, &env_context, &hugedir);
+	if (!rc) {
+		rc = spdk_app_start(&opts, moe_tgt_started, NULL);
+		spdk_app_fini();
+	}
+	free(env_context);
+	free(hugedir);
 	return rc;
 }

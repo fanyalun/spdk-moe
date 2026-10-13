@@ -114,9 +114,64 @@ MOE_TEST_TILE=1 MOE_TEST_TILE_COLS=512 MOE_TEST_ENCODING=lattice \
 
 该测量使用 `--no-huge`，`HugetlbPages` 全程为 0。本机 THP 为 `never`，
 预留的 2 MiB、1 GiB HugeTLB 页均为 0；未完成大页性能对照。
-target 支持 SPDK 默认的大页路径，本地测试通过启动参数关闭；大页环境中的
-内存占用和性能不能直接由这批普通页结果推出。无需在提交代码中另加 cgroup
-限制，按官方环境提供的硬限制运行并监测实际峰值。
+大页环境中的内存占用和性能不能直接由这批普通页结果推出。无需在提交代码中
+另加 cgroup 限制，按官方环境提供的硬限制运行并监测实际峰值。
+
+## SPDK 2 MiB 大页与预分配
+
+`moe_tgt` 默认使用 2 MiB HugeTLB，默认 SPDK 内存池为 1664 MiB（832 页）。
+优先验证 `--huge-dir` 指定的挂载点，否则自动寻找可读写的 2 MiB hugetlbfs。
+不会选择 1 GiB 页或静默退回普通页。未配置大页时启动失败并给出说明；
+本地普通页调试仍可显式传入 `--no-huge --no-pci -s 1664`。
+
+启动接入 SPDK 的 `spdk_app_opts`、`spdk_env_init` 和现有 DMA 分配接口。
+启用 DPDK `--legacy-mem` 以及仓库已有的 `MOE_FIXED_HUGEPAGES` 限额逻辑，
+在初始映射之前把 2 MiB 页数限制为指定池大小，避免先映射宿主机全部大页。
+固定池在推理时不再扩张。DPDK 初始化逐页预触碰；专家缓存和编码暂存区
+由 SPDK 分配并清零，随后执行默认 16 次完整推理预热，完成后才发布就绪。
+预分配失败发生在 EAL 初始化阶段，不能靠之后的降缓存槽位重试解决。
+
+1664 MiB 包含八槽位的 1344 MiB 专家缓存，池内余量为 320 MiB，
+用于 SPDK 对象池、DMA 暂存区、导入缓冲区等，不额外复制一份专家权重。
+普通堆、线程栈、计算工作区和元数据还需另算。按十进制 2 GB 总上限，
+池外余量约 243 MiB；是否足够须在真实大页环境记录完整生命周期峰值。
+可用 `-s` 显式调整池大小，要求正偶数 MiB；不要仅为增加余量而盲目扩大池。
+文件调试后端的专家缓存使用普通堆，不能以此配置证明缓存用了大页，
+其完整尺寸实验应沿用较小的普通页 SPDK 池。正式路径使用 AIO/NVMe 后端。
+
+在目标宿主机上由管理员预留页并挂载；以下以目标 reactor 所在 node0、
+独占实验机且当前预留不足为例，已有更大预留池时无需减少它：
+
+```sh
+# 先查看目标 NUMA 节点的 2 MiB 空闲页数；832 页应留给本次进程。
+cat /sys/devices/system/node/node0/hugepages/hugepages-2048kB/free_hugepages
+# 仅当当前预留少于 832 且无其他用户时执行；写入后检查实际页数与空闲页数。
+echo 832 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+mkdir -p /mnt/moe_hugepages_2m
+mount -t hugetlbfs -o pagesize=2M none /mnt/moe_hugepages_2m
+build/examples/moe_tgt --huge-dir /mnt/moe_hugepages_2m -c /path/to/nvme_config.json
+```
+
+管理员预留与挂载在运行 target 之前完成，应用不改宿主机预留页数、不绑定
+磁盘。NVMe 配置需要启用 PCI，不能加 `--no-pci`；本地 AIO 可加该选项。
+HugeTLB 占用不一定包含在进程 RSS/VmHWM 中，需同时检查
+`/proc/PID/status` 的 `HugetlbPages`、`smaps_rollup` 的 `Private_Hugetlb` /
+`Shared_Hugetlb` 及官方 cgroup 的内存和 hugetlb 计数，不重复相加同一份页。
+
+1 MiB 是逻辑读取/编码块大小，2 MiB 是内存映射粒度，二者无需一致。
+解码输出按原有逻辑写入 FP32 缓存，计算仍由矩阵或 tile 的就绪边界触发，
+不等待整张 2 MiB 页填满。压缩后的实际读取长度仍按设备 LBA 对齐；
+大页不改变 SSD 读取粒度或传输字节数。
+
+本机未预留 HugeTLB 且 `/sys` 只读，当前只能验证挂载选择、参数检查、
+固定池页数上限和显式普通页回归；实际大页分配、内存峰值与 P99 尚未实测。
+
+```sh
+cc -D_GNU_SOURCE -Iinclude test/moe/test_moe_hugepages.c -o /tmp/moe_hugepages_test
+/tmp/moe_hugepages_test
+cc test/moe/test_fixed_pool.c -o /tmp/moe_fixed_pool_test
+/tmp/moe_fixed_pool_test
+```
 
 ## 编码和读取
 

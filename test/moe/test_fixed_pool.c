@@ -5,9 +5,9 @@
 int
 main(void)
 {
-	const uint64_t pool = UINT64_C(1536) * 1024 * 1024;
+	const uint64_t pool = UINT64_C(1664) * 1024 * 1024;
 	uint32_t pages = 100000;
-	assert(eal_moe_limit_pages(pool, 2097152, 1, &pages) == 0 && pages == 768);
+	assert(eal_moe_limit_pages(pool, 2097152, 1, &pages) == 0 && pages == 832);
 	pages = 512;
 	assert(eal_moe_limit_pages(pool, 2097152, 1, &pages) == 0 && pages == 512);
 	pages = 0;
