@@ -64,7 +64,7 @@ def main():
     artifacts = Path(tempfile.mkdtemp(prefix='moe_pipeline_'))
     weights = artifacts / 'weights'
     weights.mkdir()
-    rng = random.Random(42)
+    rng = random.Random(int(os.environ.get('MOE_TEST_WEIGHT_SEED', '42')))
     for name, count in [('W_router_128x9.bin', 128 * 9)] + [
         (f'{kind}_{expert}_128x256.bin', 128 * 256)
         for expert in range(9) for kind in ('W_gate', 'W_up', 'W_down')
@@ -86,13 +86,18 @@ def main():
              ('file', 1, 'matrix_reject'), ('aio', 7, 'bad_pipeline'),
              ('aio', 7, 'short_source')]
     selected_case = os.environ.get('MOE_TEST_CASE')
+    if os.environ.get('MOE_TEST_FIFO'):
+        cases = [('aio', 8, fault) for fault in ('', 'threads2', 'threads4',
+                 'large_chunk', 'truncate', 'remove', 'slow', 'shutdown',
+                 'bad_gate', 'bad_up', 'bad_down')] + [('aio', 7, 'fifo_reject')]
     if selected_case is not None:
         cases = [case for case in cases if case[2] == selected_case]
         if not cases:
             raise ValueError(f'unknown test case: {selected_case}')
     for backend, slots, fault, pipeline in [
         (*case, mode) for case in cases
-        for mode in (['matrix'] if case[2] == 'short_source' else
+        for mode in (['matrix_fifo'] if os.environ.get('MOE_TEST_FIFO') else
+                     ['matrix'] if case[2] == 'short_source' else
                      ['expert', 'matrix'] if case[0] == 'aio' else ['expert'])]:
         label = f'{backend}_{slots}_{fault or "normal"}_{pipeline}'
         image = artifacts / f'{label}.bin'
@@ -129,7 +134,7 @@ def main():
         config_path.write_text(json.dumps(dict(subsystems=[dict(subsystem='bdev', config=config)])))
         log = artifacts / f'{label}.log'
         environment = dict(os.environ, MOE_TEST_WEIGHTS=str(weights))
-        if slots == 8:
+        if slots == 8 and fault not in ('truncate', 'remove') and not os.environ.get('MOE_TEST_NO_REPEAT'):
             environment['MOE_TEST_REPEAT_INPUT'] = '1'
         if fault in ('bad_gate', 'bad_up', 'bad_down'):
             environment['MOE_TEST_BAD_IMAGE'] = str(image)
@@ -168,21 +173,31 @@ def main():
                 run = subprocess.run(command, env=environment, stdout=output,
                                      stderr=subprocess.STDOUT, timeout=60)
         print(f'{label} exit={run.returncode} log={log}', flush=True)
-        if bool(run.returncode) != (fault in ('strict', 'short_source', 'matrix_reject', 'bad_pipeline')):
+        if bool(run.returncode) != (fault in ('strict', 'short_source', 'matrix_reject', 'bad_pipeline', 'fifo_reject')):
             print(log.read_text()[-10000:])
             return 1
-        if backend == 'aio' and fault not in ('truncate', 'strict', 'short_source', 'bad_pipeline'):
+        if backend == 'aio' and fault not in ('truncate', 'strict', 'short_source', 'bad_pipeline', 'fifo_reject'):
             check_layout(image, weights)
         if fault == 'short_source':
             with image.open('rb') as stream:
                 header = struct.unpack('<Q6I7Q', stream.read(88))
             assert header[2] == 0, 'failed import must remain incomplete'
-        if pipeline == 'matrix' and not run.returncode:
+        if pipeline in ('matrix', 'matrix_fifo') and not run.returncode:
             rows = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
             check_matrix_trace(rows, require_overlap=fault == 'slow')
-        if slots == 8 and not run.returncode:
+        if slots == 8 and not run.returncode and fault in ('', 'threads2', 'threads4', 'large_chunk'):
             stats = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
-            assert stats[1]['cache_hits_total'] == 8, 'repeated input must fully hit eight cached experts'
+            if not os.environ.get('MOE_TEST_NO_REPEAT'):
+                assert stats[1]['cache_hits_total'] == 8, 'repeated input must fully hit eight cached experts'
+            previous_bytes = previous_misses = 0
+            for row in stats:
+                if row['status']:
+                    continue
+                expected = (row['cache_misses_total'] - previous_misses) * 3 * 128 * 256 * 4
+                if pipeline == 'matrix_fifo':
+                    assert row['read_bytes_total'] - previous_bytes == expected
+                previous_bytes = row['read_bytes_total']
+                previous_misses = row['cache_misses_total']
     return 0
 
 

@@ -1235,7 +1235,7 @@ def main():
     p.add_argument('--weight-dir', help='Input FP32 weight directory')
     p.add_argument('--kernel', choices=['scalar', 'avx2', 'avx512'])
     p.add_argument('--diagnostics', help='Optional JSONL diagnostics path')
-    p.add_argument('--pipeline', choices=['expert', 'matrix'])
+    p.add_argument('--pipeline', choices=['expert', 'matrix', 'matrix_fifo'])
     for option in ('d-model', 'd-ff', 'num-experts', 'top-k', 'cache-slots', 'io-size',
                    'io-depth', 'prefetch', 'compute-cpu', 'compute-threads'):
         p.add_argument('--' + option, type=int)

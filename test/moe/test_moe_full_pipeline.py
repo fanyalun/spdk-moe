@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('weights', type=Path)
     parser.add_argument('destination', type=Path)
-    parser.add_argument('--pipeline', choices=['expert', 'matrix'], default='expert')
+    parser.add_argument('--pipeline', choices=['expert', 'matrix', 'matrix_fifo'], default='expert')
     parser.add_argument('--cache-slots', type=int, choices=range(1, 9), default=7)
     parser.add_argument('--mem-size', type=int, default=1536)
     parser.add_argument('--reuse-image', type=Path,

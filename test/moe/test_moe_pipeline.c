@@ -33,6 +33,7 @@ static float g_expected[D];
 static float *g_router;
 static const char *g_directory;
 static int g_round;
+static int g_rounds = 32;
 static int g_first_expert, g_bad_fd = -1;
 static off_t g_bad_offset;
 static float g_original_weight;
@@ -116,7 +117,7 @@ read_done(struct spdk_bdev_io *io, bool success, void *arg)
 		send_request();
 		return;
 	}
-	if (g_round >= 32 || g_failure_expected) {
+	if (g_round >= g_rounds || g_failure_expected) {
 		printf("invalid_output_read_failed=%d\n", !success);
 		finish(success ? 1 : 0);
 		return;
@@ -160,7 +161,7 @@ vendor_done(struct spdk_bdev_io *io, bool success, void *arg)
 		finish(0);
 		return;
 	}
-	if (success != (g_round < 32 && !g_failure_expected)) {
+	if (success != (g_round < g_rounds && !g_failure_expected)) {
 		fprintf(stderr, "unexpected vendor status round=%d success=%d\n", g_round, success);
 		finish(1);
 		return;
@@ -208,7 +209,7 @@ send_request(void)
 		state = state * 1664525U + 1013904223U;
 		g_input[i] = (float)(state >> 8) / 16777216.0f * 0.2f - 0.1f;
 	}
-	if (g_round == 32) {
+	if (g_round == g_rounds) {
 		g_input[0] = NAN;
 	} else {
 		if (compute_expected()) {
@@ -282,6 +283,17 @@ static void
 started(void *arg)
 {
 	const char *dir = getenv("MOE_TEST_WEIGHTS");
+	const char *rounds = getenv("MOE_TEST_ROUNDS");
+	if (rounds) {
+		char *end;
+		errno = 0;
+		long value = strtol(rounds, &end, 10);
+		if (errno || end == rounds || *end || value < 2 || value > 1000) {
+			finish(1);
+			return;
+		}
+		g_rounds = value;
+	}
 	if (!dir) {
 		finish(1);
 		return;

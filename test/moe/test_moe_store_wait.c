@@ -11,6 +11,8 @@ static struct { spdk_bdev_io_completion_cb callback; void *arg; } g_pending[16];
 static unsigned g_count, g_done, g_failed;
 static uint64_t g_low, g_high;
 static uint64_t g_ticks;
+static uint64_t g_offsets[128];
+static unsigned g_submitted;
 
 uint64_t
 spdk_get_ticks(void)
@@ -30,6 +32,8 @@ spdk_bdev_read(struct spdk_bdev_desc *desc, struct spdk_io_channel *channel, voi
 		assert(offset >= g_low && offset + bytes <= g_high);
 	}
 	memset(buffer, 0x5a, bytes);
+	assert(g_submitted < SPDK_COUNTOF(g_offsets));
+	g_offsets[g_submitted++] = offset;
 	g_pending[g_count].callback = callback;
 	g_pending[g_count++].arg = arg;
 	return 0;
@@ -148,6 +152,45 @@ main(void)
 		s.io_depth = 4;
 	}
 	assert(moe_store_read_matrix(&s, 0, 3, buffer, done, NULL, NULL) == -EINVAL);
+	g_high = 0;
+	g_submitted = 0;
+	unsigned char matrices[3][8192];
+	struct moe_matrix_read batch[3];
+	for (unsigned i = 0; i < 3; i++) {
+		batch[i] = (struct moe_matrix_read){
+			.expert = 0, .matrix = i, .buffer = matrices[i], .done = done,
+		};
+	}
+	unsigned before = g_done;
+	assert(!moe_store_read_batch(&s, batch, 3));
+	/* Up is submitted before Gate completes, without interleaving Gate chunks. */
+	assert(g_count == 4 && g_done == before);
+	assert(g_offsets[0] == 4096 && g_offsets[1] == 8192);
+	assert(g_offsets[2] == 12288 && g_offsets[3] == 16384);
+	assert(moe_store_read_batch(&s, batch, 3) == -EBUSY);
+	drain(false);
+	assert(g_done == before + 3 && !s.active_io && g_offsets[4] == 20480);
+	before = g_failed;
+	assert(!moe_store_read_batch(&s, batch, 3));
+	drain(true);
+	assert(g_failed == before + 3 && !s.active_io);
+	before = g_failed;
+	assert(!moe_store_read_batch(&s, batch, 3));
+	moe_store_cancel_reads(&s, -ECANCELED);
+	drain(false);
+	assert(g_failed == before + 3 && !s.active_io);
+	/* Cancellation must retain a resource-wait callback until it runs. */
+	s.io_depth = 1;
+	g_starve = true;
+	before = g_done;
+	assert(!moe_store_read_batch(&s, batch, 3));
+	moe_store_cancel_reads(&s, -ECANCELED);
+	assert(g_wait && g_done == before + 2);
+	wait = g_wait;
+	g_wait = NULL;
+	g_starve = false;
+	wait->cb_fn(wait->cb_arg);
+	assert(g_done == before + 3 && !s.active_io && !g_count);
 	puts("PASS: matrix bounds/canaries/failures, ENOMEM wait/retry, out-of-order completions, error drain, removal, exactly-once callbacks");
 	return 0;
 }

@@ -47,6 +47,27 @@ moe_layout_init(struct moe_layout *l, int d, int h, int experts, uint32_t block_
 static void store_pump(struct moe_store *s);
 
 static void
+store_meter(struct moe_store *s)
+{
+	if (!s->diagnostics) {
+		return;
+	}
+	uint64_t now = spdk_get_ticks();
+	uint64_t elapsed = s->meter_ticks ? now - s->meter_ticks : 0;
+	s->busy_ticks += s->meter_active ? elapsed : 0;
+	s->depth_ticks += s->meter_active * elapsed;
+	s->pending_idle_ticks += !s->meter_active && s->meter_pending ? elapsed : 0;
+	s->meter_ticks = now;
+	s->meter_active = s->active_io;
+	s->meter_pending = false;
+	for (unsigned i = 0; i < MOE_STORE_MAX_READS; i++) {
+		struct moe_store_read *r = &s->reads[i];
+		s->meter_pending |= r->active && !r->status &&
+			(r->next < r->length || r->outstanding);
+	}
+}
+
+static void
 base_event(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *arg)
 {
 	struct moe_store *s = arg;
@@ -366,10 +387,18 @@ read_finish_op(struct moe_store_op *op, int status)
 	}
 	if (status) {
 		r->status = status;
+		if (s->cancel_batch_on_error) {
+			for (unsigned i = 0; i < MOE_STORE_MAX_READS; i++) {
+				if (s->reads[i].active) {
+					s->reads[i].status = status;
+				}
+			}
+		}
 	}
 	r->outstanding--;
 	op->read = NULL;
 	op->submitted = false;
+	store_meter(s);
 }
 
 static void
@@ -399,11 +428,13 @@ read_submit(void *arg)
 	rc = spdk_bdev_read(s->desc, s->channel, (char *)r->buffer + op->offset,
 			    r->offset + op->offset, op->length, read_complete, op);
 	if (rc == -ENOMEM) {
+		s->resource_wait_count++;
 		op->wait.bdev = spdk_bdev_desc_get_bdev(s->desc);
 		op->wait.cb_fn = read_submit;
 		op->wait.cb_arg = op;
 		rc = spdk_bdev_queue_io_wait(op->wait.bdev, s->channel, &op->wait);
 	} else if (!rc) {
+		s->submit_count++;
 		if (r->first_submit_ticks && !*r->first_submit_ticks) {
 			*r->first_submit_ticks = spdk_get_ticks();
 		}
@@ -415,11 +446,13 @@ read_submit(void *arg)
 		read_finish_op(op, rc);
 		store_pump(s);
 	}
+	store_meter(s);
 }
 
 static void
 store_pump(struct moe_store *s)
 {
+	store_meter(s);
 	if (s->pumping) {
 		s->repump = true;
 		return;
@@ -467,6 +500,7 @@ read_range(struct moe_store *s, int expert, uint64_t offset, uint64_t length,
 	for (unsigned t = 0; t < MOE_STORE_MAX_READS; t++) {
 		struct moe_store_read *r = &s->reads[t];
 		if (!r->active) {
+			s->cancel_batch_on_error = false;
 			if (first_submit_ticks) {
 				*first_submit_ticks = 0;
 			}
@@ -487,6 +521,57 @@ moe_store_read_expert(struct moe_store *s, int expert, void *buffer,
                       moe_store_done done, void *arg)
 {
 	return read_range(s, expert, 0, s->layout.expert_stride, buffer, done, arg, NULL);
+}
+
+int
+moe_store_read_batch(struct moe_store *s, const struct moe_matrix_read *reads, unsigned count)
+{
+	if (!s->layout.complete || count > MOE_STORE_MAX_READS || atomic_load(&s->removed)) {
+		return -EINVAL;
+	}
+	/* Validate the whole batch before publishing callbacks or starting DMA. */
+	for (unsigned i = 0; i < MOE_STORE_MAX_READS; i++) {
+		if (s->reads[i].active) {
+			return -EBUSY;
+		}
+	}
+	for (unsigned i = 0; i < count; i++) {
+		if (reads[i].expert < 0 || (unsigned)reads[i].expert >= s->layout.experts ||
+		    reads[i].matrix > 2 || !reads[i].buffer || !reads[i].done) {
+			return -EINVAL;
+		}
+	}
+	s->cancel_batch_on_error = true;
+	for (unsigned i = 0; i < count; i++) {
+		const struct moe_matrix_read *item = &reads[i];
+		if (item->first_submit_ticks) {
+			*item->first_submit_ticks = 0;
+		}
+		s->reads[i] = (struct moe_store_read){
+			.store = s, .buffer = item->buffer, .active = true,
+			.done = item->done, .arg = item->arg,
+			.first_submit_ticks = item->first_submit_ticks,
+			.offset = s->layout.expert_offset +
+				  (uint64_t)item->expert * s->layout.expert_stride +
+				  item->matrix * s->layout.gate_bytes,
+			.length = item->matrix == 2 ? s->layout.down_bytes : s->layout.gate_bytes,
+		};
+	}
+	/* Descriptor order controls submission; completions may arrive out of order. */
+	store_pump(s);
+	return 0;
+}
+
+void
+moe_store_cancel_reads(struct moe_store *s, int status)
+{
+	for (unsigned i = 0; i < MOE_STORE_MAX_READS; i++) {
+		if (s->reads[i].active) {
+			s->reads[i].status = status ? status : -ECANCELED;
+		}
+	}
+	/* DMA and resource-wait callbacks keep their buffers until drained. */
+	store_pump(s);
 }
 
 int

@@ -19,6 +19,8 @@ struct moe_request {
 	uint64_t compute_start[MOE_REQUEST_MAX_K][3], compute_end[MOE_REQUEST_MAX_K][3];
 	int completed, loading, status;
 	bool routed;
+	bool fifo_queued;
+	unsigned matrix_done[MOE_REQUEST_MAX_K];
 	uint64_t start, route_ticks, expert_ticks, combine_ticks;
 	uint64_t weight_wait_ticks, weight_wait_start;
 };

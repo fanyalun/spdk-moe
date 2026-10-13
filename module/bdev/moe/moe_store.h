@@ -11,7 +11,7 @@
 
 #define MOE_STORE_MIB (1024ULL * 1024)
 #define MOE_STORE_MAX_IO 16
-#define MOE_STORE_MAX_READS 8
+#define MOE_STORE_MAX_READS 24
 
 struct moe_layout {
 	uint64_t magic;
@@ -22,6 +22,15 @@ struct moe_layout {
 
 struct moe_store;
 typedef void (*moe_store_done)(void *arg, int status);
+
+struct moe_matrix_read {
+	int expert;
+	unsigned matrix;
+	void *buffer;
+	moe_store_done done;
+	void *arg;
+	uint64_t *first_submit_ticks;
+};
 
 struct moe_store_read {
 	struct moe_store *store;
@@ -51,8 +60,13 @@ struct moe_store {
 	float *router;
 	unsigned io_size, io_depth, active_io, peak_io;
 	uint64_t read_bytes;
+	uint64_t submit_count, resource_wait_count;
+	uint64_t meter_ticks, busy_ticks, depth_ticks, pending_idle_ticks;
+	unsigned meter_active;
+	bool diagnostics, meter_pending;
 	atomic_bool removed;
 	bool pumping, repump;
+	bool cancel_batch_on_error;
 	bool require_direct_source;
 	void (*removed_cb)(void *);
 	void *removed_arg;
@@ -79,6 +93,9 @@ int moe_store_read_expert(struct moe_store *store, int expert, void *buffer,
 			  moe_store_done done, void *arg);
 int moe_store_read_matrix(struct moe_store *store, int expert, unsigned matrix,
                           void *buffer, moe_store_done done, void *arg, uint64_t *first_submit_ticks);
+int moe_store_read_batch(struct moe_store *store, const struct moe_matrix_read *reads,
+			unsigned count);
+void moe_store_cancel_reads(struct moe_store *store, int status);
 void moe_store_close(struct moe_store *store);
 
 #endif

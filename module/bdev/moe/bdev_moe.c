@@ -18,7 +18,7 @@
 struct moe_bdev;
 struct moe_load_context {
 	struct moe_bdev *moe;
-	int selected, slot;
+	int selected, slot, matrix;
 };
 
 enum moe_job { MOE_JOB_NONE, MOE_JOB_ROUTE, MOE_JOB_EXPERT, MOE_JOB_COMBINE };
@@ -42,9 +42,11 @@ struct moe_bdev {
 	struct moe_workspace ws;
 	struct moe_request request;
 	struct moe_load_context loads[MOE_REQUEST_MAX_K];
+	struct moe_load_context matrix_loads[MOE_REQUEST_MAX_K][3];
 	float *router, *last_output;
 	char *directory;
 	bool matrix_pipeline;
+	bool matrix_fifo;
 	float *intermediate;
 	bool packed, store_open, output_valid, worker_busy, worker_stop, worker_started;
 	bool closing, scheduling, reschedule;
@@ -144,7 +146,7 @@ request_finish(struct moe_bdev *moe)
 			r->route_ticks, r->expert_ticks, r->combine_ticks, r->weight_wait_ticks,
 			moe->cache.hits, moe->cache.misses,
 			moe->packed ? moe->store.read_bytes : moe->cache.read_bytes, moe->store.peak_io,
-			moe->matrix_pipeline ? "matrix" : "expert");
+			moe->matrix_fifo ? "matrix_fifo" : moe->matrix_pipeline ? "matrix" : "expert");
 		bool comma = false;
 		for (int k = 0; k < moe->ws.top_k; k++) {
 			for (int stage = 0; stage < 3; stage++) {
@@ -166,8 +168,13 @@ request_finish(struct moe_bdev *moe)
 				first = r->first_compute[k];
 			}
 		}
-		fprintf(moe->diagnostics, "],\"first_compute_wait_ticks\":%" PRIu64 "}\n",
-			first ? first - r->start : 0);
+		fprintf(moe->diagnostics, "],\"first_compute_wait_ticks\":%" PRIu64
+			",\"io_submit_total\":%" PRIu64 ",\"io_resource_wait_total\":%" PRIu64
+			",\"io_busy_ticks_total\":%" PRIu64 ",\"io_depth_ticks_total\":%" PRIu64
+			",\"io_pending_idle_ticks_total\":%" PRIu64 "}\n",
+			first ? first - r->start : 0, moe->store.submit_count,
+			moe->store.resource_wait_count, moe->store.busy_ticks,
+			moe->store.depth_ticks, moe->store.pending_idle_ticks);
 	}
 	r->io = NULL;
 	complete_io(io, r->status);
@@ -494,16 +501,94 @@ matrix_read_next(struct moe_bdev *moe, int k)
 }
 
 static void
+fifo_matrix_complete(void *arg, int status)
+{
+	struct moe_load_context *load = arg;
+	struct moe_bdev *moe = load->moe;
+	struct moe_request *r = &moe->request;
+	int k = load->selected;
+
+	r->loading--;
+	if (moe->diagnostics) {
+		r->read_end[k][load->matrix] = spdk_get_ticks();
+	}
+	if (status) {
+		r->status = status;
+		r->failed[k] = true;
+	} else {
+		r->matrix_done[k] |= 1u << load->matrix;
+		while (r->ready[k] < 3 && (r->matrix_done[k] & (1u << r->ready[k]))) {
+			r->ready[k]++;
+		}
+		if (r->ready[k] == 3) {
+			moe->cache.entries[load->slot].state = MOE_CACHE_READY;
+		}
+	}
+	request_schedule(moe);
+}
+
+static void
+fifo_queue_matrices(struct moe_bdev *moe)
+{
+	struct moe_request *r = &moe->request;
+	struct moe_matrix_read batch[MOE_STORE_MAX_READS];
+	unsigned count = 0;
+
+	r->fifo_queued = true;
+	/* Hits were pinned by ROUTE. Reserve all misses before starting any read. */
+	for (int k = 0; k < moe->ws.top_k; k++) {
+		if (r->slots[k] >= 0) {
+			continue;
+		}
+		int slot = moe_cache_reserve(&moe->cache, moe->ws.indices[k]);
+		if (slot < 0) {
+			r->status = -ENOMEM;
+			return;
+		}
+		r->slots[k] = slot;
+	}
+	for (int k = 0; k < moe->ws.top_k; k++) {
+		if (r->ready[k] == 3) {
+			continue;
+		}
+		int slot = r->slots[k];
+		struct moe_cache_entry *e = &moe->cache.entries[slot];
+		for (int stage = 0; stage < 3; stage++) {
+			struct moe_load_context *load = &moe->matrix_loads[k][stage];
+			*load = (struct moe_load_context){moe, k, slot, stage};
+			if (moe->diagnostics) {
+				r->read_start[k][stage] = spdk_get_ticks();
+			}
+			batch[count++] = (struct moe_matrix_read){
+				.expert = moe->ws.indices[k], .matrix = stage,
+				.buffer = stage == 0 ? e->w_gate : stage == 1 ? e->w_up : e->w_down,
+				.done = fifo_matrix_complete, .arg = load,
+				.first_submit_ticks = moe->diagnostics ? &r->read_submit[k][stage] : NULL,
+			};
+		}
+	}
+	r->loading = count;
+	int rc = moe_store_read_batch(&moe->store, batch, count);
+	if (rc) {
+		r->loading = 0;
+		r->status = rc;
+	}
+}
+
+static void
 matrix_schedule(struct moe_bdev *moe)
 {
 	struct moe_request *r = &moe->request;
 
-	for (int k = 0; k < moe->ws.top_k && !r->status; k++) {
+	if (moe->matrix_fifo && !r->fifo_queued) {
+		fifo_queue_matrices(moe);
+	}
+	for (int k = 0; !moe->matrix_fifo && k < moe->ws.top_k && !r->status; k++) {
 		if (r->slots[k] >= 0 && r->ready[k] < 3 && !r->reading[k]) {
 			matrix_read_next(moe, k);
 		}
 	}
-	for (int k = 0; k < moe->ws.top_k && !r->status &&
+	for (int k = 0; !moe->matrix_fifo && k < moe->ws.top_k && !r->status &&
 	     r->loading < (int)moe->prefetch; k++) {
 		if (r->computed[k] || r->slots[k] >= 0) {
 			continue;
@@ -561,7 +646,9 @@ request_schedule(struct moe_bdev *moe)
 			r->status = -ENODEV;
 		}
 		if (r->status) {
-			if (moe->matrix_pipeline) {
+			if (moe->matrix_fifo) {
+				moe_store_cancel_reads(&moe->store, r->status);
+			} else if (moe->matrix_pipeline) {
 				r->loading = 0;
 				for (int k = 0; k < moe->ws.top_k; k++) {
 					r->loading += r->reading[k];
@@ -827,8 +914,10 @@ bdev_moe_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	struct moe_bdev *moe = ctx;
 
 	spdk_json_write_named_object_begin(w, "moe");
-	spdk_json_write_named_string(w, "pipeline", moe->matrix_pipeline ? "matrix" : "expert");
+	spdk_json_write_named_string(w, "pipeline",
+				     moe->matrix_fifo ? "matrix_fifo" : moe->matrix_pipeline ? "matrix" : "expert");
 	spdk_json_write_named_int32(w, "compute_threads", moe->compute_threads);
+	spdk_json_write_named_bool(w, "prefetch_ignored", moe->matrix_fifo);
 	spdk_json_write_object_end(w);
 	return 0;
 }
@@ -843,7 +932,8 @@ bdev_moe_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w
 	spdk_json_write_named_object_begin(w, "params");
 	spdk_json_write_named_string(w, "name", bdev->name);
 	spdk_json_write_named_string(w, "weight_dir", moe->directory);
-	spdk_json_write_named_string(w, "pipeline", moe->matrix_pipeline ? "matrix" : "expert");
+	spdk_json_write_named_string(w, "pipeline",
+				     moe->matrix_fifo ? "matrix_fifo" : moe->matrix_pipeline ? "matrix" : "expert");
 	spdk_json_write_named_string(w, "kernel", moe_kernel_name(moe->ws.kernel));
 	if (moe->packed) {
 		struct spdk_bdev *base = spdk_bdev_desc_get_bdev(moe->store.desc);
@@ -1063,7 +1153,11 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 		return -EINVAL;
 	}
 	packed = strcmp(o->backend, "file") != 0;
-	bool matrix = o->pipeline && !strcmp(o->pipeline, "matrix");
+	bool fifo = o->pipeline && !strcmp(o->pipeline, "matrix_fifo");
+	bool matrix = fifo || (o->pipeline && !strcmp(o->pipeline, "matrix"));
+	if (fifo && o->cache_slots < o->top_k) {
+		return -EINVAL;
+	}
 	if ((o->pipeline && strcmp(o->pipeline, "expert") && !matrix) || (matrix && !packed)) {
 		return -EINVAL;
 	}
@@ -1105,6 +1199,7 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	moe->ready_arg = arg;
 	moe->packed = packed;
 	moe->matrix_pipeline = matrix;
+	moe->matrix_fifo = fifo;
 	if (matrix) {
 		size_t bytes = (size_t)o->top_k * 2 * o->d_ff * sizeof(float);
 		moe->intermediate = malloc(bytes);
@@ -1164,6 +1259,7 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 			goto fail;
 		}
 		moe->store_open = true;
+		moe->store.diagnostics = moe->diagnostics != NULL;
 		moe->store.removed_cb = store_removed;
 		moe->store.removed_arg = moe;
 		rc = spdk_bdev_module_claim_bdev_desc(moe->store.desc,
