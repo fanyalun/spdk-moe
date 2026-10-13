@@ -6,6 +6,7 @@
 #include "spdk/log.h"
 #include "moe_ffn/matvec_packed.h"
 #include "moe_store.h"
+#include "moe_trace.h"
 
 #define MOE_STORE_MAGIC UINT64_C(0x31454f4d4b445053)
 #define MOE_IMPORT_LIMIT (64 * MOE_STORE_MIB)
@@ -460,9 +461,14 @@ read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 	struct moe_store_op *op = arg;
 	struct moe_store *s = op->read->store;
 
+	moe_trace_end(op->trace_id);
 	spdk_bdev_free_io(io);
 	int status = success ? 0 : -EIO;
 	if (!status && op->codec) {
+		uint64_t relative = op->read->offset + op->offset - s->layout.expert_offset;
+		uint64_t trace = moe_trace_start("DECODE", relative / s->layout.expert_stride,
+					       (relative % s->layout.expert_stride) / s->layout.gate_bytes,
+					       (uint64_t)op->codec->words * 4);
 		uint64_t start = s->diagnostics ? spdk_get_ticks() : 0;
 		memset((char *)op->codec_buffer + op->codec->bytes, 0, 16);
 		status = moe_codec_decode(op->codec_buffer, MOE_STORE_MIB + 4096,
@@ -473,6 +479,7 @@ read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 		if (s->diagnostics) {
 			s->decode_ticks += spdk_get_ticks() - start;
 		}
+		moe_trace_end(trace);
 	}
 	read_finish_op(op, status);
 	store_pump(s);
@@ -502,6 +509,10 @@ read_submit(void *arg)
 		rc = spdk_bdev_queue_io_wait(op->wait.bdev, s->channel, &op->wait);
 	} else if (!rc) {
 		s->submit_count++;
+		uint64_t relative = r->offset + op->offset - s->layout.expert_offset;
+		int expert = relative / s->layout.expert_stride;
+		int stage = (relative % s->layout.expert_stride) / s->layout.gate_bytes;
+		op->trace_id = moe_trace_start("WEIGHT_IO", expert, stage, op->length);
 		if (r->first_submit_ticks && !*r->first_submit_ticks) {
 			*r->first_submit_ticks = spdk_get_ticks();
 		}

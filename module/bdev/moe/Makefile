@@ -13,6 +13,9 @@ LIBNAME = bdev_moe
 
 CFLAGS += -I$(SPDK_ROOT_DIR)/lib -I$(SPDK_ROOT_DIR)/lib/moe_ffn
 CFLAGS += -fno-fast-math
+ifneq ($(MOE_NVTX_INCLUDE),)
+CFLAGS += -DMOE_NVTX -I$(MOE_NVTX_INCLUDE)
+endif
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 
 include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

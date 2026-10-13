@@ -14,6 +14,7 @@
 #include "moe_store.h"
 #include "moe_request.h"
 #include "bdev_moe.h"
+#include "moe_trace.h"
 
 struct moe_bdev;
 struct moe_load_context {
@@ -178,6 +179,7 @@ request_finish(struct moe_bdev *moe)
 			moe->store.depth_ticks, moe->store.pending_idle_ticks,
 			moe->store.decoded_bytes, moe->store.decode_ticks);
 	}
+	moe_trace_end(r->trace_id);
 	r->io = NULL;
 	complete_io(io, r->status);
 }
@@ -212,12 +214,16 @@ compute_selected(struct moe_bdev *moe, struct moe_workspace *ws, int selected)
 	struct moe_request *r = &moe->request;
 	struct moe_cache_entry *e = &moe->cache.entries[r->slots[selected]];
 	int stage = r->stage[selected];
+	uint64_t trace = moe_trace_start("COMPUTE", moe->ws.indices[selected],
+					moe->matrix_pipeline ? stage : -1, 0);
 	if (moe->diagnostics && !r->first_compute[selected]) {
 		r->first_compute[selected] = spdk_get_ticks();
 	}
 
 	if (!moe->matrix_pipeline || stage < 0) {
-		return moe_expert(ws, e->w_gate, e->w_up, e->w_down, selected, moe->packed);
+		int rc = moe_expert(ws, e->w_gate, e->w_up, e->w_down, selected, moe->packed);
+		moe_trace_end(trace);
+		return rc;
 	}
 	float *gate = moe->intermediate + (size_t)selected * 2 * ws->d_ff;
 	float *up = gate + ws->d_ff;
@@ -230,6 +236,7 @@ compute_selected(struct moe_bdev *moe, struct moe_workspace *ws, int selected)
 	if (moe->diagnostics) {
 		r->compute_end[selected][stage] = spdk_get_ticks();
 	}
+	moe_trace_end(trace);
 	return rc;
 }
 
@@ -309,7 +316,9 @@ compute_worker(void *arg)
 		int rc = 0;
 		uint64_t load_ticks = 0;
 		if (job == MOE_JOB_ROUTE) {
+			uint64_t trace = moe_trace_start("ROUTE", -1, -1, 0);
 			rc = moe_route(&moe->ws, moe->ws.input, moe->router);
+			moe_trace_end(trace);
 		} else if (job == MOE_JOB_EXPERT) {
 			int slot = moe->request.slots[selected];
 			struct moe_cache_entry *e = &moe->cache.entries[slot];
@@ -322,7 +331,9 @@ compute_worker(void *arg)
 				rc = compute_selected(moe, &moe->ws, selected);
 			}
 		} else {
+			uint64_t trace = moe_trace_start("COMBINE", -1, -1, 0);
 			rc = moe_combine(&moe->ws, moe->last_output);
+			moe_trace_end(trace);
 		}
 		pthread_mutex_lock(&moe->mutex);
 		moe->worker_rc = rc;
@@ -781,6 +792,7 @@ process_io(void *arg)
 	}
 	memcpy(moe->ws.input, input, bytes);
 	moe->request = (struct moe_request){.io = io};
+	moe->request.trace_id = moe_trace_start("REQUEST", -1, -1, 0);
 	for (int k = 0; k < moe->ws.top_k; k++) {
 		moe->request.slots[k] = -1;
 	}

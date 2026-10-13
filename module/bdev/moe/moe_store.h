@@ -48,6 +48,7 @@ struct moe_store_read {
 
 struct moe_store_op {
 	struct moe_store_read *read;
+	uint64_t trace_id;
 	uint64_t offset, length;
 	struct spdk_bdev_io_wait_entry wait;
 	bool submitted;

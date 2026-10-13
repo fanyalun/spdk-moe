@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Capture 16 warmup + 50 reversible MoE requests')
+    parser.add_argument('--nsys', required=True)
+    parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[3]
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    config = json.loads(args.config.read_text())
+    for subsystem in config['subsystems']:
+        for entry in subsystem['config']:
+            if entry['method'] == 'bdev_moe_create':
+                if entry['params']['backend'] != 'aio':
+                    raise ValueError('Local capture requires authorized AIO scratch configuration')
+                entry['params'].update(pipeline='matrix_fifo', weight_encoding='lattice',
+                    cache_slots=8, io_size=1048576, diagnostics=str(output / 'lattice.jsonl'))
+    config_path = output / 'lattice.json'
+    config_path.write_text(json.dumps(config, indent=2))
+    sock = str(output / 'rpc.sock')
+
+    def rpc(*arguments, timeout=5):
+        return subprocess.run(['python3', str(root / 'scripts/rpc.py'), '-s', sock,
+            '-t', str(timeout), *arguments], capture_output=True, text=True, timeout=timeout + 5)
+
+    target = root / 'build/examples/moe_tgt'
+    command = [args.nsys, 'profile', '--trace=nvtx,osrt', '--sample=none',
+        '--cpuctxsw=none', '--force-overwrite=false', '-o', str(output / 'lattice'),
+        str(target), '--no-huge', '--no-pci', '-c', str(config_path), '-m', '0x400',
+        '-s', '1664', '-r', sock]
+    manifest = dict(command=command, warmup_count=16, warmup_seed=777, count=50, seed=42,
+        nsys_version=subprocess.check_output([args.nsys, '--version'], text=True).strip(),
+        revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
+        target_sha256=hashlib.sha256(target.read_bytes()).hexdigest())
+    (output / 'source.patch').write_bytes(subprocess.check_output(['git', 'diff', 'HEAD'], cwd=root))
+    print(f'Importing weights; capture output={output}', flush=True)
+    with (output / 'lattice_target.log').open('w') as log:
+        profiler = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 900
+            while True:
+                if profiler.poll() is not None:
+                    raise RuntimeError('target exited during import')
+                query = rpc('nvmf_get_subsystems', timeout=1)
+                if query.returncode == 0 and any(item.get('listen_addresses') and
+                    item.get('namespaces') for item in json.loads(query.stdout)):
+                    break
+                if time.monotonic() > deadline:
+                    raise TimeoutError('weight import')
+                time.sleep(1)
+            query = rpc('bdev_get_bdevs')
+            query.check_returncode()
+            (output / 'lattice_bdevs.json').write_text(query.stdout)
+            manifest['cpu_before'] = Path('/sys/fs/cgroup/cpu.stat').read_text()
+            for label, count, seed in [('warmup', 16, 777), ('requests', 50, 42)]:
+                print(f'{label}: count={count} seed={seed}', flush=True)
+                with (output / f'lattice_{label}.log').open('w') as bench_log:
+                    subprocess.run([str(root / 'test/moe/fixed_bench/moe_fixed_bench'),
+                        str(count), str(seed), '0', '0', str(output / f'lattice_{label}.jsonl')],
+                        stdout=bench_log, stderr=subprocess.STDOUT, check=True, timeout=300)
+            manifest['cpu_after'] = Path('/sys/fs/cgroup/cpu.stat').read_text()
+            print('Independent TCP accuracy check', flush=True)
+            with (output / 'lattice_accuracy.log').open('w') as accuracy_log:
+                subprocess.run([str(root / 'test/moe/accuracy_initiator/moe_accuracy_initiator'),
+                    '1', '4242'], stdout=accuracy_log, stderr=subprocess.STDOUT, check=True, timeout=300)
+            manifest['accuracy_passed'] = True
+        finally:
+            if profiler.poll() is None:
+                manifest['shutdown_rpc_returncode'] = rpc('spdk_kill_instance', 'SIGTERM').returncode
+                try:
+                    profiler.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    profiler.terminate()
+                    profiler.wait(timeout=30)
+            manifest['profiler_returncode'] = profiler.returncode
+            (output / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+        if profiler.returncode or not (output / 'lattice.nsys-rep').exists():
+            raise RuntimeError('Nsight capture failed')
+    subprocess.run([args.nsys, 'export', '--type', 'sqlite', '--output',
+        str(output / 'lattice.sqlite'), str(output / 'lattice.nsys-rep')], check=True)
+    print(f'Capture complete: {output}', flush=True)
+
+
+if __name__ == '__main__':
+    main()
