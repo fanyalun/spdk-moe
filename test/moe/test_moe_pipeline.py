@@ -2,6 +2,7 @@
 #  SPDX-License-Identifier: BSD-3-Clause
 import array
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -13,12 +14,12 @@ import sys
 import tempfile
 
 
-def check_layout(image, weights):
+def check_layout(image, weights, encoding='raw'):
     with image.open('rb') as stream:
         fields = struct.unpack('<Q6I7Q', stream.read(88))
         magic, version, complete, d, h, experts, block = fields[:7]
         router_offset, router_bytes, expert_offset, stride, gate_bytes, down_bytes, total = fields[7:]
-        assert (magic, version, complete, d, h, experts, block) == (0x31454f4d4b445053, 1, 1, 128, 256, 9, 64)
+        assert (magic, version, complete, d, h, experts, block) == (0x31454f4d4b445053, 2 if encoding == 'lattice' else 1, 1, 128, 256, 9, 64)
         assert total <= image.stat().st_size
         stream.seek(router_offset)
         assert stream.read(router_bytes) == (weights / 'W_router_128x9.bin').read_bytes()
@@ -30,7 +31,22 @@ def check_layout(image, weights):
                 expected = b''.join(original[(row * cols + col) * 4:(row * cols + col + 64) * 4]
                                     for col in range(0, cols, 64) for row in range(rows))
                 stream.seek(offset)
-                assert stream.read(size) == expected + b'\0' * (size - len(expected))
+                if encoding == 'raw':
+                    actual = stream.read(size)
+                else:
+                    matrix = ['W_gate', 'W_up', 'W_down'].index(name)
+                    stream.seek(88 + (expert * 3 + matrix) * 24)
+                    words, length, scale, base, bits, checksum = struct.unpack('<IIiiII', stream.read(24))
+                    stream.seek(offset)
+                    payload = stream.read(length)
+                    if bits == 32:
+                        actual = payload
+                    else:
+                        mask = (1 << bits) - 1
+                        actual = b''.join(struct.pack('<f', math.ldexp(float(base +
+                            ((int.from_bytes(payload[(i * bits) // 8:(i * bits) // 8 + 8], 'little')
+                              >> ((i * bits) % 8)) & mask)), -scale)) for i in range(words))
+                assert actual == expected + b'\0' * (size - len(expected))
                 offset += size
 
 
@@ -69,7 +85,9 @@ def main():
         (f'{kind}_{expert}_128x256.bin', 128 * 256)
         for expert in range(9) for kind in ('W_gate', 'W_up', 'W_down')
     ]:
-        data = array.array('f', (rng.uniform(-0.1, 0.1) for _ in range(count)))
+        data = array.array('f', ((rng.randint(-1048576, 1048576) / 16777216
+                               if os.environ.get('MOE_TEST_LATTICE_WEIGHTS') else rng.uniform(-0.1, 0.1))
+                              for _ in range(count)))
         if sys.byteorder != 'little':
             data.byteswap()
         with (weights / name).open('wb') as stream:
@@ -85,11 +103,14 @@ def main():
                                   ('aio', 7, 'shutdown'), ('aio', 7, 'bad_gate'), ('aio', 7, 'bad_up'), ('aio', 7, 'bad_down'),
              ('file', 1, 'matrix_reject'), ('aio', 7, 'bad_pipeline'),
              ('aio', 7, 'short_source')]
+    encoding = os.environ.get('MOE_TEST_ENCODING', 'raw')
     selected_case = os.environ.get('MOE_TEST_CASE')
     if os.environ.get('MOE_TEST_FIFO'):
         cases = [('aio', 8, fault) for fault in ('', 'threads2', 'threads4',
                  'large_chunk', 'truncate', 'remove', 'slow', 'shutdown',
                  'bad_gate', 'bad_up', 'bad_down')] + [('aio', 7, 'fifo_reject')]
+    if encoding == 'lattice':
+        cases = [case for case in cases if case[2] != 'large_chunk']
     if selected_case is not None:
         cases = [case for case in cases if case[2] == selected_case]
         if not cases:
@@ -108,6 +129,10 @@ def main():
                       d_model=128, d_ff=256, num_experts=9, top_k=8, cache_slots=slots,
                       diagnostics=str(artifacts / f'{label}_stats.jsonl'))
         params['pipeline'] = pipeline
+        params['weight_encoding'] = encoding
+        if os.environ.get('MOE_TEST_DEFAULTS') and backend == 'aio' and slots == 8 and not fault:
+            for key in ('cache_slots', 'pipeline', 'weight_encoding'):
+                params.pop(key)
         params['compute_threads'] = int(fault[-1]) if fault.startswith('threads') else 1
         if fault == 'tune':
             params.update(io_size=256 * 1024, io_depth=16, prefetch=4, compute_threads=4)
@@ -177,7 +202,7 @@ def main():
             print(log.read_text()[-10000:])
             return 1
         if backend == 'aio' and fault not in ('truncate', 'strict', 'short_source', 'bad_pipeline', 'fifo_reject'):
-            check_layout(image, weights)
+            check_layout(image, weights, encoding)
         if fault == 'short_source':
             with image.open('rb') as stream:
                 header = struct.unpack('<Q6I7Q', stream.read(88))
@@ -195,7 +220,10 @@ def main():
                     continue
                 expected = (row['cache_misses_total'] - previous_misses) * 3 * 128 * 256 * 4
                 if pipeline == 'matrix_fifo':
-                    assert row['read_bytes_total'] - previous_bytes == expected
+                    if encoding == 'raw':
+                        assert row['read_bytes_total'] - previous_bytes == expected
+                    else:
+                        assert row['read_bytes_total'] - previous_bytes <= expected
                 previous_bytes = row['read_bytes_total']
                 previous_misses = row['cache_misses_total']
     return 0

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PARSER = argparse.ArgumentParser(description='50-request AIO comparison; reimports configured scratch image')
 PARSER.add_argument('config', type=Path, help='Authorized existing AIO scratch-image configuration')
 PARSER.add_argument('output', type=Path)
+PARSER.add_argument('--encoding-comparison', action='store_true')
 ARGS = PARSER.parse_args()
 OUT = ARGS.output.resolve()
 BASE = ARGS.config.resolve()
@@ -36,6 +37,11 @@ CASES = [('baseline7', {}), ('baseline8', dict(cache_slots=8)),
          ('baseline8_repeat1', dict(cache_slots=8)),
          ('baseline8_repeat2', dict(cache_slots=8)),
          ('fifo8_repeat2', dict(cache_slots=8, pipeline='matrix_fifo'))]
+if ARGS.encoding_comparison:
+    CASES = [(label, dict(cache_slots=8, pipeline='matrix_fifo', weight_encoding=encoding))
+             for label, encoding in [('raw_fifo8', 'raw'), ('lattice8', 'lattice'),
+                 ('lattice8_repeat1', 'lattice'), ('raw_fifo8_repeat1', 'raw'),
+                 ('raw_fifo8_repeat2', 'raw'), ('lattice8_repeat2', 'lattice')]]
 
 
 def cpu_stat():
@@ -80,7 +86,8 @@ def main():
             if entry['method'] == 'bdev_moe_create' and entry['params']['backend'] != 'aio':
                 raise ValueError('This local simulation runner requires AIO')
     (OUT / 'method.json').write_text(json.dumps(dict(count=COUNT, seed=42, warmup_count=16,
-        warmup_seed=777, p99='nearest rank ceil(0.99*n)', target_cpu=10, initiator_cpu=0,
+        warmup_seed=777, p99='nearest rank ceil(0.99*n)',
+        binary_sha256=hashlib.sha256(TARGET.read_bytes()).hexdigest(), target_cpu=10, initiator_cpu=0,
         source_revision=subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse',
         'HEAD'], text=True).strip(), source_patch_sha256=hashlib.sha256(
         subprocess.check_output(['git', '-C', str(ROOT), 'diff', 'HEAD'])).hexdigest()), indent=2))
@@ -137,7 +144,7 @@ def main():
                 latencies = sorted(row['latency_ns'] / 1000000 for row in rows)
                 env = dict(os.environ, MOE_INITIATOR_CPU_MASK='0x1')
                 with (OUT / f'{label}_accuracy.log').open('w') as accuracy_log:
-                    subprocess.run([str(ACCURACY), '50' if label == 'fifo8' else '1', '4242'], stdout=accuracy_log,
+                    subprocess.run([str(ACCURACY), '50' if label in ('fifo8', 'lattice8') else '1', '4242'], stdout=accuracy_log,
                         stderr=subprocess.STDOUT, env=env, timeout=1200, check=True)
                 stat_after = cpu_stat()
                 item = dict(label=label, parameters=params, request_count=COUNT,

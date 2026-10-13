@@ -4,7 +4,7 @@
 默认 FP32、AVX2/FMA、7 槽位、1 个持久计算线程、1MiB 读取、4 个应用层 I/O、最多 2 个专家换入。
 `moe_bench` 的协议、时钟、统计和输出未修改。
 
-矩阵级可选调度与测试见 [matrix_pipeline.md](matrix_pipeline.md)。未指定 `pipeline` 时仍使用专家级调度。
+矩阵级调度与测试见 [matrix_pipeline.md](matrix_pipeline.md)。AIO/NVMe 后端槽位足够时现默认使用 FIFO；可逆编码默认配置见 [reversible_weights.md](reversible_weights.md)。
 
 ## 构建和小规模验证
 

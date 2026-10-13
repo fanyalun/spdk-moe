@@ -1,6 +1,6 @@
 # 矩阵级加载与计算流水线
 
-`bdev_moe_create` 新增 `pipeline`，取值为 `expert`（默认）或 `matrix`。矩阵级模式仅适用于 AIO/NVMe，支持现有 1/2/4 个计算线程。文件调试后端指定 matrix 时拒绝创建；未知模式同样失败。`bdev_get_bdevs` 的 `driver_specific.moe.pipeline` 显示实际模式。
+`bdev_moe_create` 支持 `pipeline=expert`、`matrix` 和 `matrix_fifo`。AIO/NVMe 后端槽位足够时现默认使用 FIFO 和可逆编码，详见 [reversible_weights.md](reversible_weights.md)。矩阵级模式仅适用于 AIO/NVMe，支持现有 1/2/4 个计算线程。文件调试后端指定 matrix 时拒绝创建；未知模式同样失败。`bdev_get_bdevs` 的 `driver_specific.moe.pipeline` 显示实际模式。
 
 ## 配置与行为
 

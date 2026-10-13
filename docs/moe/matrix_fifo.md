@@ -2,7 +2,8 @@
 
 `pipeline=matrix_fifo` reserves every selected cache miss before starting reads. It
 requires `cache_slots >= top_k` (eight slots for the official Top-8 workload).
-Existing `matrix` and `expert` modes retain their behavior and defaults. `prefetch`
+Packed backends with enough slots now default to FIFO; see
+[reversible_weights.md](reversible_weights.md) for encoding defaults. `prefetch`
 does not limit FIFO admission; `bdev_get_bdevs` exposes `prefetch_ignored=true`.
 
 ## Submission and ownership
@@ -44,7 +45,8 @@ make -C examples/moe/tgt -j4
 make -C test/moe/pipeline -j4
 make -C test/moe/accuracy_initiator -j4
 cc -D_GNU_SOURCE -O1 -g -ffunction-sections -fdata-sections -Iinclude -Ilib \
-  test/moe/test_moe_store_wait.c -Wl,--gc-sections -lpthread -o /tmp/moe_store_wait_test
+  test/moe/test_moe_store_wait.c module/bdev/moe/moe_codec.c \
+  -Wl,--gc-sections -lm -lpthread -o /tmp/moe_store_wait_test
 /tmp/moe_store_wait_test
 MOE_TEST_FIFO=1 MOE_TEST_ROUNDS=50 python3 test/moe/test_moe_pipeline.py
 MOE_TEST_FIFO=1 MOE_TEST_CASE= MOE_TEST_ROUNDS=50 MOE_TEST_NO_REPEAT=1 MOE_TEST_WEIGHT_SEED=43 \

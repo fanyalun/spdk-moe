@@ -202,7 +202,7 @@ import_matrix(struct moe_store *s, const float *raw, int rows, int cols,
 
 	for (uint64_t start = 0; start < bytes; start += MOE_STORE_MIB) {
 		uint64_t length = spdk_min(MOE_STORE_MIB, bytes - start);
-		float *dest = s->import_buffer;
+		float *dest = s->lattice && packed ? s->encode_buffer : s->import_buffer;
 		uint64_t first = start / sizeof(float);
 		uint64_t limit = spdk_min(elements, first + length / sizeof(float));
 
@@ -217,7 +217,26 @@ import_matrix(struct moe_store *s, const float *raw, int rows, int cols,
 				memcpy(dest + q - first, raw + row * cols + col, width * sizeof(float));
 			}
 		}
-		int rc = import_io(s, offset + start, length, false);
+		int rc;
+		uint64_t stored = length;
+		if (s->lattice && packed) {
+			uint64_t relative = offset - s->layout.expert_offset;
+			unsigned expert = relative / s->layout.expert_stride;
+			unsigned matrix = (relative % s->layout.expert_stride) / s->layout.gate_bytes;
+			unsigned index = expert * s->codec_expert_blocks +
+					 matrix * s->codec_gate_blocks + start / MOE_STORE_MIB;
+			struct moe_codec_block *block = &s->codec_blocks[index];
+			rc = moe_codec_encode(dest, length / 4, s->import_buffer,
+					      MOE_STORE_MIB + 4096, block);
+			if (rc) {
+				return rc;
+			}
+			stored = spdk_max((uint64_t)spdk_bdev_get_block_size(
+				spdk_bdev_desc_get_bdev(s->desc)), align_up(block->bytes,
+				spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(s->desc))));
+			memset((char *)s->import_buffer + block->bytes, 0, stored - block->bytes);
+		}
+		rc = import_io(s, offset + start, stored, false);
 		if (rc) {
 			return rc;
 		}
@@ -235,6 +254,8 @@ import_finished(void *arg)
 	s->import_started = false;
 	spdk_dma_free(s->import_buffer);
 	s->import_buffer = NULL;
+	free(s->encode_buffer);
+	s->encode_buffer = NULL;
 	s->ready(s->ready_arg, status);
 }
 
@@ -298,6 +319,10 @@ import_worker(void *arg)
 		l->complete = 1;
 		memset(s->import_buffer, 0, MOE_STORE_MIB);
 		memcpy(s->import_buffer, l, sizeof(*l));
+		if (s->lattice) {
+			memcpy((char *)s->import_buffer + sizeof(*l), s->codec_blocks,
+			       (size_t)s->codec_expert_blocks * l->experts * sizeof(*s->codec_blocks));
+		}
 		rc = import_io(s, 0, MOE_STORE_MIB, false);
 	}
 	if (!rc) {
@@ -313,7 +338,7 @@ done:
 int
 moe_store_open(struct moe_store *s, const char *base, const char *directory,
 	       int d, int h, int experts, bool strict_nvme, unsigned io_size,
-	       unsigned io_depth, moe_store_done ready, void *arg)
+	       unsigned io_depth, bool lattice, moe_store_done ready, void *arg)
 {
 	struct spdk_bdev *bdev;
 	int rc;
@@ -326,6 +351,7 @@ moe_store_open(struct moe_store *s, const char *base, const char *directory,
 	s->ready = ready;
 	s->require_direct_source = strict_nvme;
 	s->ready_arg = arg;
+	s->lattice = lattice;
 	rc = spdk_bdev_open_ext(base, true, base_event, s, &s->desc);
 	if (rc) {
 		goto fail;
@@ -340,6 +366,24 @@ moe_store_open(struct moe_store *s, const char *base, const char *directory,
 	if (rc) {
 		goto fail;
 	}
+	if (lattice) {
+		s->codec_gate_blocks = (s->layout.gate_bytes + MOE_STORE_MIB - 1) / MOE_STORE_MIB;
+		s->codec_expert_blocks = 2 * s->codec_gate_blocks +
+			(s->layout.down_bytes + MOE_STORE_MIB - 1) / MOE_STORE_MIB;
+		uint64_t count = (uint64_t)s->codec_expert_blocks * experts;
+		if (io_size != MOE_STORE_MIB ||
+		    count > (MOE_STORE_MIB - sizeof(s->layout)) / sizeof(*s->codec_blocks)) {
+			rc = -ENOTSUP;
+			goto fail;
+		}
+		s->codec_blocks = calloc(count, sizeof(*s->codec_blocks));
+		s->encode_buffer = malloc(MOE_STORE_MIB);
+		if (!s->codec_blocks || !s->encode_buffer) {
+			rc = -ENOMEM;
+			goto fail;
+		}
+		s->layout.version = 2;
+	}
 	if (io_depth < 1 || io_depth > MOE_STORE_MAX_IO || io_size < 4096 ||
 	    io_size % spdk_bdev_get_block_size(bdev) ||
 	    spdk_bdev_get_buf_align(bdev) > 4096 ||
@@ -351,7 +395,7 @@ moe_store_open(struct moe_store *s, const char *base, const char *directory,
 	s->channel = spdk_bdev_get_io_channel(s->desc);
 	s->directory = strdup(directory);
 	s->router = malloc(s->layout.router_bytes);
-	s->import_buffer = spdk_dma_zmalloc(MOE_STORE_MIB,
+	s->import_buffer = spdk_dma_zmalloc(MOE_STORE_MIB + (lattice ? 4096 : 0),
 					  spdk_max(4096, spdk_bdev_get_buf_align(bdev)), NULL);
 	if (!s->channel || !s->directory || !s->router || !s->import_buffer) {
 		rc = -ENOMEM;
@@ -359,6 +403,15 @@ moe_store_open(struct moe_store *s, const char *base, const char *directory,
 	}
 	s->io_size = io_size;
 	s->io_depth = io_depth;
+	if (lattice) {
+		for (unsigned i = 0; i < io_depth; i++) {
+			s->ops[i].codec_buffer = spdk_dma_zmalloc(MOE_STORE_MIB + 4096, 4096, NULL);
+			if (!s->ops[i].codec_buffer) {
+				rc = -ENOMEM;
+				goto fail;
+			}
+		}
+	}
 	SPDK_NOTICELOG("MoE store module=%s bytes=%" PRIu64 " import_buffer<=64MiB\n",
 		       spdk_bdev_get_module_name(bdev), s->layout.total_bytes);
 	rc = pthread_create(&s->importer, NULL, import_worker, s);
@@ -408,7 +461,20 @@ read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 	struct moe_store *s = op->read->store;
 
 	spdk_bdev_free_io(io);
-	read_finish_op(op, success ? 0 : -EIO);
+	int status = success ? 0 : -EIO;
+	if (!status && op->codec) {
+		uint64_t start = s->diagnostics ? spdk_get_ticks() : 0;
+		memset((char *)op->codec_buffer + op->codec->bytes, 0, 16);
+		status = moe_codec_decode(op->codec_buffer, MOE_STORE_MIB + 4096,
+					  (float *)((char *)op->read->buffer + op->offset), op->codec);
+		if (!status) {
+			s->decoded_bytes += (uint64_t)op->codec->words * 4;
+		}
+		if (s->diagnostics) {
+			s->decode_ticks += spdk_get_ticks() - start;
+		}
+	}
+	read_finish_op(op, status);
 	store_pump(s);
 }
 
@@ -425,7 +491,8 @@ read_submit(void *arg)
 		store_pump(s);
 		return;
 	}
-	rc = spdk_bdev_read(s->desc, s->channel, (char *)r->buffer + op->offset,
+	rc = spdk_bdev_read(s->desc, s->channel,
+			    op->codec ? op->codec_buffer : (char *)r->buffer + op->offset,
 			    r->offset + op->offset, op->length, read_complete, op);
 	if (rc == -ENOMEM) {
 		s->resource_wait_count++;
@@ -477,6 +544,18 @@ store_pump(struct moe_store *s)
 			op->offset = r->next;
 			op->length = spdk_min(s->io_size, r->length - r->next);
 			r->next += op->length;
+			op->codec = NULL;
+			if (s->lattice) {
+				op->codec = &s->codec_blocks[r->codec_index + op->offset / MOE_STORE_MIB];
+				if ((uint64_t)op->codec->words * 4 != op->length) {
+					r->status = -EINVAL;
+					op->read = NULL;
+					break;
+				}
+				unsigned block_size = spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(s->desc));
+				op->length = spdk_max((uint64_t)block_size,
+						  align_up(op->codec->bytes, block_size));
+			}
 			r->outstanding++;
 			read_submit(op);
 		}
@@ -508,6 +587,8 @@ read_range(struct moe_store *s, int expert, uint64_t offset, uint64_t length,
 				.store = s, .buffer = buffer, .active = true, .done = done, .arg = arg,
 				.offset = s->layout.expert_offset + (uint64_t)expert * s->layout.expert_stride + offset,
 				.length = length, .first_submit_ticks = first_submit_ticks,
+				.codec_index = s->lattice ? expert * s->codec_expert_blocks +
+					       (offset / s->layout.gate_bytes) * s->codec_gate_blocks : 0,
 			};
 			store_pump(s);
 			return 0;
@@ -520,6 +601,9 @@ int
 moe_store_read_expert(struct moe_store *s, int expert, void *buffer,
                       moe_store_done done, void *arg)
 {
+	if (s->lattice) {
+		return -ENOTSUP;
+	}
 	return read_range(s, expert, 0, s->layout.expert_stride, buffer, done, arg, NULL);
 }
 
@@ -555,6 +639,8 @@ moe_store_read_batch(struct moe_store *s, const struct moe_matrix_read *reads, u
 				  (uint64_t)item->expert * s->layout.expert_stride +
 				  item->matrix * s->layout.gate_bytes,
 			.length = item->matrix == 2 ? s->layout.down_bytes : s->layout.gate_bytes,
+			.codec_index = item->expert * s->codec_expert_blocks +
+				       item->matrix * s->codec_gate_blocks,
 		};
 	}
 	/* Descriptor order controls submission; completions may arrive out of order. */
@@ -600,6 +686,11 @@ moe_store_close(struct moe_store *s)
 		spdk_bdev_close(s->desc);
 	}
 	spdk_dma_free(s->import_buffer);
+	for (unsigned i = 0; i < MOE_STORE_MAX_IO; i++) {
+		spdk_dma_free(s->ops[i].codec_buffer);
+	}
+	free(s->codec_blocks);
+	free(s->encode_buffer);
 	free(s->directory);
 	free(s->router);
 	pthread_mutex_destroy(&s->mutex);

@@ -22,6 +22,7 @@ static const struct spdk_json_object_decoder create_decoders[] = {
 	DECODER(kernel, spdk_json_decode_string, true),
 	DECODER(diagnostics, spdk_json_decode_string, true),
 	DECODER(pipeline, spdk_json_decode_string, true),
+	DECODER(weight_encoding, spdk_json_decode_string, true),
 	DECODER(d_model, spdk_json_decode_int32, true),
 	DECODER(d_ff, spdk_json_decode_int32, true),
 	DECODER(num_experts, spdk_json_decode_int32, true),
@@ -44,6 +45,7 @@ free_create(struct create_rpc *r)
 	free((void *)r->opts.kernel);
 	free((void *)r->opts.diagnostics);
 	free((void *)r->opts.pipeline);
+	free((void *)r->opts.weight_encoding);
 	free(r);
 }
 
@@ -74,7 +76,7 @@ rpc_bdev_moe_create(struct spdk_jsonrpc_request *request, const struct spdk_json
 	r->request = request;
 	r->opts = (struct moe_create_opts){
 		.d_model = MOE_D_MODEL, .d_ff = MOE_D_FF, .num_experts = MOE_NUM_EXPERTS,
-		.top_k = MOE_TOP_K, .cache_slots = 7, .io_size = 1024 * 1024, .io_depth = 4, .prefetch = 2,
+		.top_k = MOE_TOP_K, .cache_slots = 8, .io_size = 1024 * 1024, .io_depth = 4, .prefetch = 2,
 		.compute_cpu = -1,
 		.compute_threads = 1,
 	};

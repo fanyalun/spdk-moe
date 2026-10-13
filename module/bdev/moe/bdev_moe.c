@@ -171,10 +171,12 @@ request_finish(struct moe_bdev *moe)
 		fprintf(moe->diagnostics, "],\"first_compute_wait_ticks\":%" PRIu64
 			",\"io_submit_total\":%" PRIu64 ",\"io_resource_wait_total\":%" PRIu64
 			",\"io_busy_ticks_total\":%" PRIu64 ",\"io_depth_ticks_total\":%" PRIu64
-			",\"io_pending_idle_ticks_total\":%" PRIu64 "}\n",
+			",\"io_pending_idle_ticks_total\":%" PRIu64
+			",\"decoded_bytes_total\":%" PRIu64 ",\"decode_ticks_total\":%" PRIu64 "}\n",
 			first ? first - r->start : 0, moe->store.submit_count,
 			moe->store.resource_wait_count, moe->store.busy_ticks,
-			moe->store.depth_ticks, moe->store.pending_idle_ticks);
+			moe->store.depth_ticks, moe->store.pending_idle_ticks,
+			moe->store.decoded_bytes, moe->store.decode_ticks);
 	}
 	r->io = NULL;
 	complete_io(io, r->status);
@@ -918,6 +920,7 @@ bdev_moe_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 				     moe->matrix_fifo ? "matrix_fifo" : moe->matrix_pipeline ? "matrix" : "expert");
 	spdk_json_write_named_int32(w, "compute_threads", moe->compute_threads);
 	spdk_json_write_named_bool(w, "prefetch_ignored", moe->matrix_fifo);
+	spdk_json_write_named_string(w, "weight_encoding", moe->store.lattice ? "lattice" : "raw");
 	spdk_json_write_object_end(w);
 	return 0;
 }
@@ -935,6 +938,7 @@ bdev_moe_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w
 	spdk_json_write_named_string(w, "pipeline",
 				     moe->matrix_fifo ? "matrix_fifo" : moe->matrix_pipeline ? "matrix" : "expert");
 	spdk_json_write_named_string(w, "kernel", moe_kernel_name(moe->ws.kernel));
+	spdk_json_write_named_string(w, "weight_encoding", moe->store.lattice ? "lattice" : "raw");
 	if (moe->packed) {
 		struct spdk_bdev *base = spdk_bdev_desc_get_bdev(moe->store.desc);
 		spdk_json_write_named_string(w, "backend", spdk_bdev_get_module_name(base));
@@ -1153,7 +1157,14 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 		return -EINVAL;
 	}
 	packed = strcmp(o->backend, "file") != 0;
-	bool fifo = o->pipeline && !strcmp(o->pipeline, "matrix_fifo");
+	bool fifo = o->pipeline ? !strcmp(o->pipeline, "matrix_fifo") :
+		    packed && o->cache_slots >= o->top_k;
+	bool lattice = o->weight_encoding ? !strcmp(o->weight_encoding, "lattice") :
+		       fifo && o->io_size == MOE_STORE_MIB;
+	if ((o->weight_encoding && strcmp(o->weight_encoding, "raw") && !lattice) ||
+	    (lattice && (!fifo || o->io_size != MOE_STORE_MIB))) {
+		return -EINVAL;
+	}
 	bool matrix = fifo || (o->pipeline && !strcmp(o->pipeline, "matrix"));
 	if (fifo && o->cache_slots < o->top_k) {
 		return -EINVAL;
@@ -1253,7 +1264,7 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 		moe->cache.capacity = o->cache_slots;
 		rc = moe_store_open(&moe->store, o->base_bdev, moe->directory, o->d_model,
 				    o->d_ff, o->num_experts, strcmp(o->backend, "nvme") == 0,
-				    o->io_size, o->io_depth, store_ready, moe);
+				    o->io_size, o->io_depth, lattice, store_ready, moe);
 		if (rc) {
 			moe->cache.capacity = 0;
 			goto fail;

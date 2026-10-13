@@ -45,6 +45,12 @@ spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc)
 	return (void *)1;
 }
 
+uint32_t
+spdk_bdev_get_block_size(const struct spdk_bdev *bdev)
+{
+	return 512;
+}
+
 int
 spdk_bdev_queue_io_wait(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 			struct spdk_bdev_io_wait_entry *entry)

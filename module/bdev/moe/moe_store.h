@@ -8,6 +8,7 @@
 #include "spdk/thread.h"
 #include <pthread.h>
 #include <stdatomic.h>
+#include "moe_codec.h"
 
 #define MOE_STORE_MIB (1024ULL * 1024)
 #define MOE_STORE_MAX_IO 16
@@ -36,6 +37,7 @@ struct moe_store_read {
 	struct moe_store *store;
 	void *buffer;
 	uint64_t offset, next, length;
+	unsigned codec_index;
 	uint64_t *first_submit_ticks;
 	unsigned outstanding;
 	int status;
@@ -49,6 +51,8 @@ struct moe_store_op {
 	uint64_t offset, length;
 	struct spdk_bdev_io_wait_entry wait;
 	bool submitted;
+	void *codec_buffer;
+	struct moe_codec_block *codec;
 };
 
 struct moe_store {
@@ -68,6 +72,11 @@ struct moe_store {
 	bool pumping, repump;
 	bool cancel_batch_on_error;
 	bool require_direct_source;
+	bool lattice;
+	struct moe_codec_block *codec_blocks;
+	unsigned codec_gate_blocks, codec_expert_blocks;
+	void *encode_buffer;
+	uint64_t decoded_bytes, decode_ticks;
 	void (*removed_cb)(void *);
 	void *removed_arg;
 	struct moe_store_read reads[MOE_STORE_MAX_READS];
@@ -88,7 +97,7 @@ struct moe_store {
 int moe_layout_init(struct moe_layout *layout, int d, int h, int experts, uint32_t block_size);
 int moe_store_open(struct moe_store *store, const char *base, const char *directory,
 		   int d, int h, int experts, bool strict_nvme, unsigned io_size,
-		   unsigned io_depth, moe_store_done ready, void *arg);
+		   unsigned io_depth, bool lattice, moe_store_done ready, void *arg);
 int moe_store_read_expert(struct moe_store *store, int expert, void *buffer,
 			  moe_store_done done, void *arg);
 int moe_store_read_matrix(struct moe_store *store, int expert, unsigned matrix,
