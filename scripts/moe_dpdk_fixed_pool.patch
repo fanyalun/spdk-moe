@@ -1,0 +1,53 @@
+diff --git a/lib/eal/linux/eal_memory.c b/lib/eal/linux/eal_memory.c
+index 711e5efabe..e00b90f106 100644
+--- a/lib/eal/linux/eal_memory.c
++++ b/lib/eal/linux/eal_memory.c
+@@ -41,6 +41,7 @@
+ #include "eal_filesystem.h"
+ #include "eal_hugepages.h"
+ #include "eal_options.h"
++#include "eal_moe_memory.h"
+ #include "malloc_elem.h"
+ 
+ #define PFN_MASK_SIZE	8
+@@ -1245,6 +1246,17 @@ eal_legacy_hugepage_init(void)
+ 		return 0;
+ 	}
+ 
++	// MoE opts into a fixed single-page-size pool, including initialization.
++	// Legacy EAL otherwise maps all host free pages before releasing the excess.
++	if (getenv("MOE_FIXED_HUGEPAGES") != NULL) {
++		struct hugepage_info *hpi = &internal_conf->hugepage_info[0];
++		if (eal_moe_limit_pages(internal_conf->memory, hpi->hugepage_sz,
++					internal_conf->num_hugepage_sizes, &hpi->num_pages[0])) {
++			EAL_LOG(ERR, "MoE fixed pool requires one 2MiB page size and explicit memory");
++			return -1;
++		}
++	}
++
+ 	/* calculate total number of hugepages available. at this point we haven't
+ 	 * yet started sorting them so they all are on socket 0 */
+ 	for (i = 0; i < (int) internal_conf->num_hugepage_sizes; i++) {
+diff --git a/lib/eal/linux/eal_moe_memory.h b/lib/eal/linux/eal_moe_memory.h
+new file mode 100644
+index 0000000000..4600318b5f
+--- /dev/null
++++ b/lib/eal/linux/eal_moe_memory.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#ifndef EAL_MOE_MEMORY_H
++#define EAL_MOE_MEMORY_H
++#include <stdint.h>
++
++static inline int
++eal_moe_limit_pages(uint64_t bytes, uint64_t page_size, unsigned sizes, uint32_t *pages)
++{
++	if (sizes != 1 || page_size != UINT64_C(2097152) || bytes == 0 ||
++	    bytes % page_size != 0 || bytes / page_size > UINT32_MAX)
++		return -1;
++	uint32_t limit = bytes / page_size;
++	if (*pages > limit)
++		*pages = limit;
++	return 0;
++}
++#endif
