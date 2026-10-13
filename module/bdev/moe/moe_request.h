@@ -8,6 +8,7 @@
 struct moe_request {
 	struct spdk_bdev_io *io;
 	uint64_t trace_id;
+	uint64_t wait_trace;
 	int slots[MOE_REQUEST_MAX_K];
 	bool computed[MOE_REQUEST_MAX_K];
 	unsigned ready[MOE_REQUEST_MAX_K], progress[MOE_REQUEST_MAX_K];

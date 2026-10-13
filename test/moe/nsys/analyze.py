@@ -45,7 +45,7 @@ def analyze(directory, label):
     events = []
     pattern = re.compile(r'^(REQUEST|COMPUTE|WEIGHT_IO|ROUTE|COMBINE) expert=(-?\d+) stage=(-?\d+) bytes=(\d+)$')
     for start, end, text, thread in raw:
-        match = pattern.match(text or '')
+        match = pattern.match((text or '').split(' | meta:')[-1])
         if match:
             if end is None:
                 raise ValueError(f'incomplete NVTX range: {text}')

@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -35,18 +36,26 @@ def main():
             '-t', str(timeout), *arguments], capture_output=True, text=True, timeout=timeout + 5)
 
     target = root / 'build/examples/moe_tgt'
-    command = [args.nsys, 'profile', '--trace=nvtx,osrt', '--sample=none',
-        '--cpuctxsw=none', '--force-overwrite=false', '-o', str(output / 'lattice'),
+    command = [args.nsys, 'profile', '--trace=nvtx', '--sample=none',
+        '--capture-range=nvtx', '--nvtx-capture=PROFILE_WINDOW', '--capture-range-end=stop',
+        '--cpuctxsw=none', '--force-overwrite=false', '-o', str(output / 'moe_cpu_experts_io_decode'),
         str(target), '--no-huge', '--no-pci', '-c', str(config_path), '-m', '0x400',
         '-s', '1664', '-r', sock]
     manifest = dict(command=command, warmup_count=16, warmup_seed=777, count=50, seed=42,
         nsys_version=subprocess.check_output([args.nsys, '--version'], text=True).strip(),
         revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         target_sha256=hashlib.sha256(target.read_bytes()).hexdigest())
+    manifest['capture_window'] = dict(first_request=17, last_request=66, includes_warmup=False)
+    sources = ['lib/moe_ffn/moe_trace.h', 'lib/moe_ffn/moe_workspace.c',
+               'module/bdev/moe/bdev_moe.c', 'module/bdev/moe/moe_store.c']
+    manifest['source_sha256'] = {path: hashlib.sha256((root / path).read_bytes()).hexdigest()
+                                for path in sources}
+    (output / 'moe_trace_source.h').write_bytes((root / sources[0]).read_bytes())
     (output / 'source.patch').write_bytes(subprocess.check_output(['git', 'diff', 'HEAD'], cwd=root))
     print(f'Importing weights; capture output={output}', flush=True)
     with (output / 'lattice_target.log').open('w') as log:
-        profiler = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        environment = dict(os.environ, MOE_PROFILE_FIRST='17', MOE_PROFILE_COUNT='50')
+        profiler = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment)
         try:
             deadline = time.monotonic() + 900
             while True:
@@ -85,10 +94,10 @@ def main():
                     profiler.wait(timeout=30)
             manifest['profiler_returncode'] = profiler.returncode
             (output / 'manifest.json').write_text(json.dumps(manifest, indent=2))
-        if profiler.returncode or not (output / 'lattice.nsys-rep').exists():
+        if profiler.returncode or not (output / 'moe_cpu_experts_io_decode.nsys-rep').exists():
             raise RuntimeError('Nsight capture failed')
     subprocess.run([args.nsys, 'export', '--type', 'sqlite', '--output',
-        str(output / 'lattice.sqlite'), str(output / 'lattice.nsys-rep')], check=True)
+        str(output / 'lattice.sqlite'), str(output / 'moe_cpu_experts_io_decode.nsys-rep')], check=True)
     print(f'Capture complete: {output}', flush=True)
 
 

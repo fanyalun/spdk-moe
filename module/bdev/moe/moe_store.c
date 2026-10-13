@@ -466,7 +466,7 @@ read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 	int status = success ? 0 : -EIO;
 	if (!status && op->codec) {
 		uint64_t relative = op->read->offset + op->offset - s->layout.expert_offset;
-		uint64_t trace = moe_trace_start("DECODE", relative / s->layout.expert_stride,
+		moe_trace_push("DECODE", relative / s->layout.expert_stride,
 					       (relative % s->layout.expert_stride) / s->layout.gate_bytes,
 					       (uint64_t)op->codec->words * 4);
 		uint64_t start = s->diagnostics ? spdk_get_ticks() : 0;
@@ -479,7 +479,7 @@ read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 		if (s->diagnostics) {
 			s->decode_ticks += spdk_get_ticks() - start;
 		}
-		moe_trace_end(trace);
+		moe_trace_pop();
 	}
 	read_finish_op(op, status);
 	store_pump(s);
@@ -498,9 +498,15 @@ read_submit(void *arg)
 		store_pump(s);
 		return;
 	}
+	uint64_t relative = r->offset + op->offset - s->layout.expert_offset;
+	int expert = relative / s->layout.expert_stride;
+	int stage = s->layout.gate_bytes ?
+		    (int)((relative % s->layout.expert_stride) / s->layout.gate_bytes) : -1;
+	moe_trace_push("IO_SUBMIT", expert, stage, op->length);
 	rc = spdk_bdev_read(s->desc, s->channel,
 			    op->codec ? op->codec_buffer : (char *)r->buffer + op->offset,
 			    r->offset + op->offset, op->length, read_complete, op);
+	moe_trace_pop();
 	if (rc == -ENOMEM) {
 		s->resource_wait_count++;
 		op->wait.bdev = spdk_bdev_desc_get_bdev(s->desc);
@@ -509,9 +515,6 @@ read_submit(void *arg)
 		rc = spdk_bdev_queue_io_wait(op->wait.bdev, s->channel, &op->wait);
 	} else if (!rc) {
 		s->submit_count++;
-		uint64_t relative = r->offset + op->offset - s->layout.expert_offset;
-		int expert = relative / s->layout.expert_stride;
-		int stage = (relative % s->layout.expert_stride) / s->layout.gate_bytes;
 		op->trace_id = moe_trace_start("WEIGHT_IO", expert, stage, op->length);
 		if (r->first_submit_ticks && !*r->first_submit_ticks) {
 			*r->first_submit_ticks = spdk_get_ticks();

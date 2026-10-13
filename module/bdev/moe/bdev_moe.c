@@ -179,7 +179,12 @@ request_finish(struct moe_bdev *moe)
 			moe->store.depth_ticks, moe->store.pending_idle_ticks,
 			moe->store.decoded_bytes, moe->store.decode_ticks);
 	}
+	if (r->wait_trace) {
+		moe_trace_end(r->wait_trace);
+		r->wait_trace = 0;
+	}
 	moe_trace_end(r->trace_id);
+	moe_trace_capture(moe->sequence, false);
 	r->io = NULL;
 	complete_io(io, r->status);
 }
@@ -214,15 +219,16 @@ compute_selected(struct moe_bdev *moe, struct moe_workspace *ws, int selected)
 	struct moe_request *r = &moe->request;
 	struct moe_cache_entry *e = &moe->cache.entries[r->slots[selected]];
 	int stage = r->stage[selected];
-	uint64_t trace = moe_trace_start("COMPUTE", moe->ws.indices[selected],
-					moe->matrix_pipeline ? stage : -1, 0);
+	moe_trace_push("COMPUTE", moe->ws.indices[selected],
+		       moe->matrix_pipeline ? stage : -1, 0);
+	moe_trace_set_expert(moe->ws.indices[selected]);
 	if (moe->diagnostics && !r->first_compute[selected]) {
 		r->first_compute[selected] = spdk_get_ticks();
 	}
 
 	if (!moe->matrix_pipeline || stage < 0) {
 		int rc = moe_expert(ws, e->w_gate, e->w_up, e->w_down, selected, moe->packed);
-		moe_trace_end(trace);
+		moe_trace_pop();
 		return rc;
 	}
 	float *gate = moe->intermediate + (size_t)selected * 2 * ws->d_ff;
@@ -236,7 +242,7 @@ compute_selected(struct moe_bdev *moe, struct moe_workspace *ws, int selected)
 	if (moe->diagnostics) {
 		r->compute_end[selected][stage] = spdk_get_ticks();
 	}
-	moe_trace_end(trace);
+	moe_trace_pop();
 	return rc;
 }
 
@@ -301,10 +307,13 @@ compute_worker(void *arg)
 {
 	struct moe_bdev *moe = arg;
 
+	moe_trace_name_thread("CPU Compute / Router + Experts + Aggregate");
 	pthread_mutex_lock(&moe->mutex);
 	for (;;) {
 		while (!moe->job_ready && !moe->worker_stop) {
+			moe_trace_push("WAIT_WORKER", -1, -1, 0);
 			pthread_cond_wait(&moe->condition, &moe->mutex);
+			moe_trace_pop();
 		}
 		if (moe->worker_stop) {
 			break;
@@ -316,9 +325,9 @@ compute_worker(void *arg)
 		int rc = 0;
 		uint64_t load_ticks = 0;
 		if (job == MOE_JOB_ROUTE) {
-			uint64_t trace = moe_trace_start("ROUTE", -1, -1, 0);
+			moe_trace_push("ROUTE", -1, -1, 0);
 			rc = moe_route(&moe->ws, moe->ws.input, moe->router);
-			moe_trace_end(trace);
+			moe_trace_pop();
 		} else if (job == MOE_JOB_EXPERT) {
 			int slot = moe->request.slots[selected];
 			struct moe_cache_entry *e = &moe->cache.entries[slot];
@@ -331,9 +340,9 @@ compute_worker(void *arg)
 				rc = compute_selected(moe, &moe->ws, selected);
 			}
 		} else {
-			uint64_t trace = moe_trace_start("COMBINE", -1, -1, 0);
+			moe_trace_push("COMBINE", -1, -1, 0);
 			rc = moe_combine(&moe->ws, moe->last_output);
-			moe_trace_end(trace);
+			moe_trace_pop();
 		}
 		pthread_mutex_lock(&moe->mutex);
 		moe->worker_rc = rc;
@@ -427,6 +436,10 @@ extra_worker(void *arg)
 static bool
 submit_expert(struct moe_bdev *moe, int selected)
 {
+	if (moe->request.wait_trace) {
+		moe_trace_end(moe->request.wait_trace);
+		moe->request.wait_trace = 0;
+	}
 	if (moe->request.weight_wait_start) {
 		moe->request.weight_wait_ticks += spdk_get_ticks() - moe->request.weight_wait_start;
 		moe->request.weight_wait_start = 0;
@@ -681,6 +694,9 @@ request_schedule(struct moe_bdev *moe)
 		}
 		if (moe->matrix_pipeline) {
 			matrix_schedule(moe);
+			if (!moe->worker_busy && !moe->extra_busy && r->loading && !r->wait_trace) {
+				r->wait_trace = moe_trace_start("WAIT_MATRIX", -1, -1, 0);
+			}
 			if (moe->diagnostics && !moe->worker_busy && !moe->extra_busy &&
 			    r->loading && !r->weight_wait_start) {
 				r->weight_wait_start = spdk_get_ticks();
@@ -792,7 +808,9 @@ process_io(void *arg)
 	}
 	memcpy(moe->ws.input, input, bytes);
 	moe->request = (struct moe_request){.io = io};
-	moe->request.trace_id = moe_trace_start("REQUEST", -1, -1, 0);
+	moe_trace_name_thread("CPU IO + Decode / SPDK owner");
+	moe_trace_capture(moe->sequence + 1, true);
+	moe->request.trace_id = moe_trace_start("REQUEST", -1, -1, moe->sequence + 1);
 	for (int k = 0; k < moe->ws.top_k; k++) {
 		moe->request.slots[k] = -1;
 	}

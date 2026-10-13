@@ -12,6 +12,9 @@ LIBNAME = moe_ffn
 
 CFLAGS += -I$(SPDK_ROOT_DIR)/lib/moe_ffn
 CFLAGS += -fno-fast-math -ffp-contract=fast
+ifneq ($(MOE_NVTX_INCLUDE),)
+CFLAGS += -DMOE_NVTX -I$(MOE_NVTX_INCLUDE)
+endif
 SYS_LIBS += -lm
 
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map

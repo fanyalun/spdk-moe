@@ -4,11 +4,16 @@
 #include "silu.h"
 #include "softmax.h"
 #include "topk.h"
+#include "moe_trace.h"
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef MOE_NVTX
+_Thread_local int moe_trace_expert_id = -1;
+#endif
 
 int moe_workspace_init(struct moe_workspace *ws, int d_model, int d_ff,
                        int num_experts, int top_k, enum moe_kernel kernel)
@@ -71,12 +76,18 @@ int moe_route(struct moe_workspace *ws, const float *input, const float *router)
         return -ERANGE;
     }
     memmove(ws->input, input, (size_t)ws->d_model * sizeof(float));
+    moe_trace_push("ROUTER", -1, -1, 0);
     matvec_ordered(ws->input, router, ws->d_model, ws->num_experts, ws->logits, ws->kernel, 0);
+    moe_trace_pop();
     if (finite_vector(ws->logits, ws->num_experts)) {
         return -ERANGE;
     }
+    moe_trace_push("TOPK", -1, -1, 0);
     topk_select(ws->logits, ws->num_experts, ws->top_k, ws->indices, ws->weights);
+    moe_trace_pop();
+    moe_trace_push("NORMALIZE", -1, -1, 0);
     softmax(ws->weights, ws->top_k);
+    moe_trace_pop();
     return finite_vector(ws->weights, ws->top_k);
 }
 
@@ -85,16 +96,24 @@ int moe_expert_stage(struct moe_workspace *ws, enum moe_stage stage,
 {
     switch (stage) {
     case MOE_STAGE_GATE:
+        moe_trace_push("GATE", moe_trace_get_expert(), 0, 0);
         matvec_ordered(ws->input, weight, ws->d_model, ws->d_ff, gate, ws->kernel, packed);
+        moe_trace_pop();
         return 0;
     case MOE_STAGE_UP:
+        moe_trace_push("UP", moe_trace_get_expert(), 1, 0);
         matvec_ordered(ws->input, weight, ws->d_model, ws->d_ff, up, ws->kernel, packed);
+        moe_trace_pop();
+        moe_trace_push("SILU_MULTIPLY", moe_trace_get_expert(), 1, 0);
         for (int i = 0; i < ws->d_ff; i++) {
             gate[i] = silu(gate[i]) * up[i];
         }
+        moe_trace_pop();
         return 0;
     case MOE_STAGE_DOWN:
+        moe_trace_push("DOWN", moe_trace_get_expert(), 2, 0);
         matvec_ordered(gate, weight, ws->d_ff, ws->d_model, output, ws->kernel, packed);
+        moe_trace_pop();
         return finite_vector(output, ws->d_model);
     default:
         return -EINVAL;

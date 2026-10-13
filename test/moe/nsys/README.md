@@ -8,6 +8,8 @@ read only. Each mode starts with an empty expert cache.
 NVTX is opt-in at build time. Supply the directory containing `nvtx3/nvToolsExt.h`:
 
 ```sh
+make -C lib/moe_ffn -j4 -W moe_workspace.c \
+  MOE_NVTX_INCLUDE=/usr/local/cuda-12.8/targets/x86_64-linux/include
 make -C module/bdev/moe -j4 -W bdev_moe.c -W moe_store.c \
   MOE_NVTX_INCLUDE=/usr/local/cuda-12.8/targets/x86_64-linux/include
 make -C examples/moe/tgt -j4
@@ -55,7 +57,8 @@ and the final independent accuracy request. `compute_overlap_percent` divides
 overlap by compute time, not request or I/O time. Profiled timings are diagnostic
 samples, not an uninstrumented performance qualification.
 
-To return to a build without NVTX, rebuild `module/bdev/moe` with
+To return to a build without NVTX, first rebuild `lib/moe_ffn` with `-W moe_workspace.c`
+without `MOE_NVTX_INCLUDE`, then rebuild `module/bdev/moe` with
 `-W bdev_moe.c -W moe_store.c` and without `MOE_NVTX_INCLUDE`, then relink target
 and tests. Make does not detect changes to command-line compilation flags automatically.
 
@@ -66,20 +69,56 @@ python3 test/moe/nsys/capture_reversible.py \
   --nsys /opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys \
   --config /path/to/authorized_aio_target.json --output /path/to/new_capture
 python3 test/moe/nsys/analyze_reversible.py /path/to/new_capture
+python3 test/moe/nsys/validate_reversible.py /path/to/new_capture
 ```
 
 This capture enables eight slots, matrix FIFO, 1 MiB reversible coding and
 diagnostics. It preserves the compute kernel and thread settings in the source
 configuration. It reimports its authorized scratch image, warms up 16 requests
 with seed 777, captures exactly 50 requests with seed 42, then checks accuracy
-independently with seed 4242. Sampling/context switches are disabled; no new
+independently with seed 4242. The GUI report contains only the 50 timed requests:
+`PROFILE_WINDOW` starts at request 17 and ends at request 66. Import and warmup
+are outside the report. Sampling/context switches and OS runtime tracing are disabled; no new
 dependencies are installed. SQLite export runs automatically after target shutdown.
 
 The analyzer validates I/O and decode bytes against diagnostics, separates warmup
 and accuracy requests, and measures the union of decode and compute intervals.
 It reports their mutual overlap and coverage by outstanding I/O separately.
 `lattice_timeline.png` and `.svg` show median and P99 requests; plotting uses
-an existing Matplotlib installation. Open `lattice.nsys-rep` for individual I/O,
+an existing Matplotlib installation. Open `moe_cpu_experts_io_decode.nsys-rep` for individual I/O,
 expert, matrix and decoder ranges. An I/O range represents software observed
 submission to callback, and may include completion handling delays. It does not
 prove SSD DMA was physically active throughout that interval.
+
+## GUI reading guide
+
+The current workload executes on CPUs. It has no CUDA kernels, H2D copies or
+GPU waiting intervals. `Normalize` here is routing-weight Softmax; the workload
+does not contain input RMSNorm or LayerNorm.
+
+1. Expand the target process and the thread named
+   **CPU Compute / Router + Experts + Aggregate**, then expand its **NVTX** row.
+   Actual CPU stages use thread-local push/pop ranges and nested leaf stages.
+2. Expand **CPU IO + Decode / SPDK owner**, then its **NVTX** row. Orange ranges
+   are `Expert ID / Gate|Up|Down / CPU Decode + checksum + FP32 writeback`.
+   Dark blue ranges are the CPU's `SPDK read` submission, not the device transfer.
+3. Expand the process-level NVTX/Annotations row for async **Request**,
+   blue **I/O outstanding** and red **Pipeline wait** ranges. Their durations
+   span submission/completion or coordinator dependency, not CPU core occupancy.
+4. Select **Request 17 / CPU MoE Forward** and zoom to that request. Router,
+   Top-K and Normalize are short; zoom into the beginning of the request to read them.
+   Further zoom into a few milliseconds to inspect 1 MiB block decoders.
+5. Right-click a row and use **Show in Events View** to read full labels and
+   durations. The searchable names include the real expert ID and matrix name.
+
+Green expert leaf stages are Gate, Up, SiLU(Gate)*Up and Down; routing is purple;
+aggregation is pink. Red **CPU worker condvar wait** is the actual condition-variable
+wait for owner dispatch, which can include matrix readiness and dispatch delay.
+Red **Pipeline wait** specifically records the coordinator observing no active
+compute while matrix reads/decodes remain pending. Neither is a GPU interval.
+The report preserves all block events; four in-flight I/O chunks may overlap.
+Collection start/stop can delay the first/last TCP responses. This capture is a
+pipeline diagnosis; its TCP P99 must not replace the uninstrumented benchmark.
+
+Nsight's `Show in Events View` operation is documented in the
+[official GUI guide](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#timeline-events-correlation).

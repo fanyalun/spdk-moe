@@ -23,7 +23,7 @@ def analyze(directory):
                          r'expert=(-?\d+) stage=(-?\d+) bytes=(\d+)$')
     events = []
     for start, end, text, thread in raw:
-        match = pattern.match(text or '')
+        match = pattern.match((text or '').split(' | meta:')[-1])
         if match:
             if end is None or end <= start:
                 raise ValueError(f'incomplete NVTX interval: {text}')
@@ -35,12 +35,22 @@ def analyze(directory):
     clients = load_rows(directory / 'lattice_requests.jsonl')
     manifest = json.loads((directory / 'manifest.json').read_text())
     warmup = manifest['warmup_count']
-    if len(clients) != manifest['count'] or len(requests) != warmup + len(clients) + 1:
+    windowed = len(requests) == len(clients)
+    if len(clients) != manifest['count'] or (not windowed and len(requests) != warmup + len(clients) + 1):
         raise ValueError('NVTX request count differs from warmup + timed + accuracy')
-    if len(diagnostics) != len(requests) or any(row['status'] for row in diagnostics):
+    if len(diagnostics) != warmup + len(clients) + 1 or any(row['status'] for row in diagnostics):
         raise ValueError('diagnostic request count/status mismatch')
     rows = []
     previous_bytes = previous_decoded = previous_misses = 0
+    if windowed:
+        prior = diagnostics[warmup - 1]
+        previous_bytes = prior['read_bytes_total']
+        previous_decoded = prior['decoded_bytes_total']
+        previous_misses = prior['cache_misses_total']
+        diagnostics = diagnostics[warmup:warmup + len(clients)]
+        warmup_offset = 0
+    else:
+        warmup_offset = warmup
     for index, (request, diagnostic) in enumerate(zip(requests, diagnostics)):
         contained = [event for event in events if event['kind'] != 'REQUEST' and
                      request['start'] <= event['start'] and event['end'] <= request['end']]
@@ -79,11 +89,11 @@ def analyze(directory):
             io_bytes=io_bytes, decoded_bytes=decoded_bytes, misses=misses,
             io_ranges=len(by_kind['WEIGHT_IO']), decode_ranges=len(by_kind['DECODE']),
             io_outstanding_ms=sum(e['end'] - e['start'] for e in by_kind['WEIGHT_IO']) / 1e6)
-        if warmup <= index < warmup + len(clients):
-            row['timed_request'] = index - warmup
-            row['tcp_latency_ms'] = clients[index - warmup]['latency_ns'] / 1e6
+        if warmup_offset <= index < warmup_offset + len(clients):
+            row['timed_request'] = index - warmup_offset
+            row['tcp_latency_ms'] = clients[index - warmup_offset]['latency_ns'] / 1e6
         rows.append(row)
-    timed = rows[warmup:warmup + len(clients)]
+    timed = rows[warmup_offset:warmup_offset + len(clients)]
     numeric = [key for key, value in timed[0].items()
                if isinstance(value, (int, float)) and key not in ('request', 'timed_request')]
     means = {key: statistics.mean(row[key] for row in timed) for key in numeric}
@@ -104,7 +114,8 @@ def analyze(directory):
         mean_io_outstanding=means['io_outstanding_ms'] / means['total_ms'],
         threads={kind: sorted({event['thread'] for event in events if event['kind'] == kind})
                  for kind in ('COMPUTE', 'DECODE', 'WEIGHT_IO')},
-        rows=rows, notes='Instrumented AIO; software observed outstanding I/O, not PCIe wire time')
+        rows=rows, notes='Instrumented AIO; software observed outstanding I/O, not PCIe wire time. '
+            'NVTX capture start/stop may delay boundary TCP requests; not P99 qualification.')
     (directory / 'lattice_overlap.json').write_text(json.dumps(summary, indent=2))
     print(json.dumps({key: value for key, value in summary.items() if key != 'rows'}, indent=2))
     plot(directory, events, timed)
