@@ -72,7 +72,8 @@ python3 test/moe/nsys/analyze_reversible.py /path/to/new_capture
 python3 test/moe/nsys/validate_reversible.py /path/to/new_capture
 ```
 
-This capture enables eight slots, matrix FIFO, 1 MiB reversible coding and
+This capture enables eight slots, matrix FIFO (or preserves `tile_fifo` in the input),
+1 MiB reversible coding and
 diagnostics. It preserves the compute kernel and thread settings in the source
 configuration. It reimports its authorized scratch image, warms up 16 requests
 with seed 777, captures exactly 50 requests with seed 42, then checks accuracy
@@ -80,6 +81,9 @@ independently with seed 4242. The GUI report contains only the 50 timed requests
 `PROFILE_WINDOW` starts at request 17 and ends at request 66. Import and warmup
 are outside the report. Sampling/context switches and OS runtime tracing are disabled; no new
 dependencies are installed. SQLite export runs automatically after target shutdown.
+Use `--accuracy-count 50` to compare 50 independent inputs against the reference.
+Tile mode leaf ranges include `channels=first..last`; validation checks complete
+channel coverage for each expert and matrix, including whole cache-hit paths.
 
 The analyzer validates I/O and decode bytes against diagnostics, separates warmup
 and accuracy requests, and measures the union of decode and compute intervals.

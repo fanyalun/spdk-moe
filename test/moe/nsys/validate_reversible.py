@@ -27,6 +27,10 @@ def main(directory):
             events.append(dict(kind=kind, expert=int(expert), stage=int(stage), bytes=int(size),
                                start=start, end=end, tid=tid, event_type=event_type, text=text))
     counts = Counter(event['kind'] for event in events)
+    config = json.loads((directory / 'lattice.json').read_text())
+    params = next(entry['params'] for subsystem in config['subsystems']
+                  for entry in subsystem['config'] if entry['method'] == 'bdev_moe_create')
+    tiled = params.get('pipeline') == 'tile_fifo'
     requests = [event for event in events if event['kind'] == 'REQUEST']
     if len(requests) != 50 or [event['bytes'] for event in requests] != list(range(17, 67)):
         raise ValueError('report must contain exactly requests 17 through 66')
@@ -34,7 +38,7 @@ def main(directory):
         if counts[kind] != 50:
             raise ValueError(f'{kind}: expected 50, got {counts[kind]}')
     for kind in ('GATE', 'UP', 'SILU_MULTIPLY', 'DOWN'):
-        if counts[kind] != 400:
+        if counts[kind] < 400 or (not tiled and counts[kind] != 400):
             raise ValueError(f'{kind}: expected 400, got {counts[kind]}')
     thread_kinds = {}
     for kind in ('ROUTER', 'TOPK', 'NORMALIZE', 'GATE', 'UP', 'DOWN', 'COMBINE',
@@ -54,6 +58,23 @@ def main(directory):
             raise ValueError('every request must compute eight identified experts')
         if expert_sets[0] != expert_sets[1] or expert_sets[0] != expert_sets[2]:
             raise ValueError('Gate, Up and Down expert IDs differ')
+        if tiled:
+            for kind in ('GATE', 'UP', 'DOWN'):
+                expected = params.get('d_model', 2048) if kind == 'DOWN' else params.get('d_ff', 7168)
+                for expert in expert_sets[0]:
+                    group = [event for event in contained if event['kind'] == kind and
+                             event['expert'] == expert]
+                    ranges = []
+                    for event in group:
+                        match = re.search(r'channels=(\d+)\.\.(\d+)', event['text'])
+                        ranges.append((int(match[1]), int(match[2]) + 1) if match else (0, expected))
+                    cursor = 0
+                    for first, end in sorted(ranges):
+                        if first != cursor or end <= first:
+                            raise ValueError('slice channel coverage has gaps or overlaps')
+                        cursor = end
+                    if cursor != expected:
+                        raise ValueError('slice channel coverage incomplete')
     if counts['DECODE'] != counts['WEIGHT_IO'] or counts['DECODE'] != counts['IO_SUBMIT']:
         raise ValueError('read, submit and decode block counts differ')
     if not counts['WAIT_MATRIX'] or not counts['WAIT_WORKER']:

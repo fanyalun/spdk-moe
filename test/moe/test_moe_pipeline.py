@@ -14,12 +14,12 @@ import sys
 import tempfile
 
 
-def check_layout(image, weights, encoding='raw'):
+def check_layout(image, weights, encoding='raw', expected_h=256):
     with image.open('rb') as stream:
         fields = struct.unpack('<Q6I7Q', stream.read(88))
         magic, version, complete, d, h, experts, block = fields[:7]
         router_offset, router_bytes, expert_offset, stride, gate_bytes, down_bytes, total = fields[7:]
-        assert (magic, version, complete, d, h, experts, block) == (0x31454f4d4b445053, 2 if encoding == 'lattice' else 1, 1, 128, 256, 9, 64)
+        assert (magic, version, complete, d, h, experts, block) == (0x31454f4d4b445053, 2 if encoding == 'lattice' else 1, 1, 128, expected_h, 9, 64)
         assert total <= image.stat().st_size
         stream.seek(router_offset)
         assert stream.read(router_bytes) == (weights / 'W_router_128x9.bin').read_bytes()
@@ -35,22 +35,25 @@ def check_layout(image, weights, encoding='raw'):
                     actual = stream.read(size)
                 else:
                     matrix = ['W_gate', 'W_up', 'W_down'].index(name)
-                    stream.seek(88 + (expert * 3 + matrix) * 24)
-                    words, length, scale, base, bits, checksum = struct.unpack('<IIiiII', stream.read(24))
-                    stream.seek(offset)
-                    payload = stream.read(length)
-                    if bits == 32:
-                        actual = payload
-                    else:
-                        mask = (1 << bits) - 1
-                        actual = b''.join(struct.pack('<f', math.ldexp(float(base +
-                            ((int.from_bytes(payload[(i * bits) // 8:(i * bits) // 8 + 8], 'little')
-                              >> ((i * bits) % 8)) & mask)), -scale)) for i in range(words))
+                    blocks = (size + 1048575) // 1048576
+                    actual = bytearray()
+                    for piece in range(blocks):
+                        stream.seek(88 + (expert * 3 * blocks + matrix * blocks + piece) * 24)
+                        words, length, scale, base, bits, checksum = struct.unpack('<IIiiII', stream.read(24))
+                        stream.seek(offset + piece * 1048576)
+                        payload = stream.read(length)
+                        if bits == 32:
+                            actual.extend(payload)
+                        else:
+                            mask = (1 << bits) - 1
+                            actual.extend(b''.join(struct.pack('<f', math.ldexp(float(base +
+                                ((int.from_bytes(payload[(i * bits) // 8:(i * bits) // 8 + 8], 'little')
+                                  >> ((i * bits) % 8)) & mask)), -scale)) for i in range(words)))
                 assert actual == expected + b'\0' * (size - len(expected))
                 offset += size
 
 
-def check_matrix_trace(rows, require_overlap=False):
+def check_matrix_trace(rows, require_overlap=False, tiled=False):
     early = overlap = False
     for row in rows:
         if row['status']:
@@ -60,8 +63,10 @@ def check_matrix_trace(rows, require_overlap=False):
             start, end = event['compute_start'], event['compute_end']
             if not start:
                 continue
-            assert event['read_start'] <= event['read_submit'] <= event['read_end'] <= start <= end
-            if stage:
+            assert event['read_start'] <= event['read_submit'] <= start <= end
+            if not tiled:
+                assert event['read_end'] <= start
+            if stage and not tiled:
                 assert events[selected, stage - 1]['compute_end'] <= start
             if stage < 2:
                 assert events[selected, stage + 1]['read_start'] <= start
@@ -77,12 +82,16 @@ def check_matrix_trace(rows, require_overlap=False):
 def main():
     root = Path(__file__).resolve().parents[2]
     binary = root / 'test/moe/pipeline/moe_pipeline_test'
+    wide = bool(os.environ.get('MOE_TEST_WIDE'))
+    h = 4096 if wide else 256
+    if wide:
+        binary = root / 'test/moe/tile_progress/moe_tile_progress_test'
     artifacts = Path(tempfile.mkdtemp(prefix='moe_pipeline_'))
     weights = artifacts / 'weights'
     weights.mkdir()
     rng = random.Random(int(os.environ.get('MOE_TEST_WEIGHT_SEED', '42')))
     for name, count in [('W_router_128x9.bin', 128 * 9)] + [
-        (f'{kind}_{expert}_128x256.bin', 128 * 256)
+        (f'{kind}_{expert}_128x{h}.bin', 128 * h)
         for expert in range(9) for kind in ('W_gate', 'W_up', 'W_down')
     ]:
         data = array.array('f', ((rng.randint(-1048576, 1048576) / 16777216
@@ -105,7 +114,7 @@ def main():
              ('aio', 7, 'short_source')]
     encoding = os.environ.get('MOE_TEST_ENCODING', 'raw')
     selected_case = os.environ.get('MOE_TEST_CASE')
-    if os.environ.get('MOE_TEST_FIFO'):
+    if os.environ.get('MOE_TEST_FIFO') or os.environ.get('MOE_TEST_TILE'):
         cases = [('aio', 8, fault) for fault in ('', 'threads2', 'threads4',
                  'large_chunk', 'truncate', 'remove', 'slow', 'shutdown',
                  'bad_gate', 'bad_up', 'bad_down')] + [('aio', 7, 'fifo_reject')]
@@ -117,23 +126,28 @@ def main():
             raise ValueError(f'unknown test case: {selected_case}')
     for backend, slots, fault, pipeline in [
         (*case, mode) for case in cases
-        for mode in (['matrix_fifo'] if os.environ.get('MOE_TEST_FIFO') else
+        for mode in (['tile_fifo'] if os.environ.get('MOE_TEST_TILE') else
+                     ['matrix_fifo'] if os.environ.get('MOE_TEST_FIFO') else
                      ['matrix'] if case[2] == 'short_source' else
                      ['expert', 'matrix'] if case[0] == 'aio' else ['expert'])]:
         label = f'{backend}_{slots}_{fault or "normal"}_{pipeline}'
         image = artifacts / f'{label}.bin'
         if backend == 'aio':
             with image.open('xb') as stream:
-                stream.truncate(11 * 1024 * 1024)
+                stream.truncate((56 if wide else 11) * 1024 * 1024)
         params = dict(name='moe_test', backend=backend, weight_dir=str(weights),
-                      d_model=128, d_ff=256, num_experts=9, top_k=8, cache_slots=slots,
+                      d_model=128, d_ff=h, num_experts=9, top_k=8, cache_slots=slots,
                       diagnostics=str(artifacts / f'{label}_stats.jsonl'))
         params['pipeline'] = pipeline
         params['weight_encoding'] = encoding
+        if pipeline == 'tile_fifo':
+            params['compute_tile_cols'] = int(os.environ.get('MOE_TEST_TILE_COLS', '128'))
         if os.environ.get('MOE_TEST_DEFAULTS') and backend == 'aio' and slots == 8 and not fault:
             for key in ('cache_slots', 'pipeline', 'weight_encoding'):
                 params.pop(key)
         params['compute_threads'] = int(fault[-1]) if fault.startswith('threads') else 1
+        if wide:
+            params['compute_cpu'] = 5
         if fault == 'tune':
             params.update(io_size=256 * 1024, io_depth=16, prefetch=4, compute_threads=4)
         elif fault == 'large_chunk':
@@ -145,7 +159,7 @@ def main():
             config.append(dict(method='bdev_aio_create', params=dict(
                 name='weight_aio', filename=str(image), block_size=512)))
         if fault in ('slow', 'shutdown'):
-            config.append(dict(method='bdev_set_qos_limit', params=dict(name='weight_aio', r_mbytes_per_sec=1)))
+            config.append(dict(method='bdev_set_qos_limit', params=dict(name='weight_aio', r_mbytes_per_sec=16 if wide else 1)))
         if fault == 'strict':
             params['backend'] = 'nvme'
         if fault == 'matrix_reject':
@@ -202,14 +216,19 @@ def main():
             print(log.read_text()[-10000:])
             return 1
         if backend == 'aio' and fault not in ('truncate', 'strict', 'short_source', 'bad_pipeline', 'fifo_reject'):
-            check_layout(image, weights, encoding)
+            check_layout(image, weights, encoding, h)
         if fault == 'short_source':
             with image.open('rb') as stream:
                 header = struct.unpack('<Q6I7Q', stream.read(88))
             assert header[2] == 0, 'failed import must remain incomplete'
-        if pipeline in ('matrix', 'matrix_fifo') and not run.returncode:
+        if pipeline in ('matrix', 'matrix_fifo', 'tile_fifo') and not run.returncode:
             rows = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
-            check_matrix_trace(rows, require_overlap=fault == 'slow')
+            check_matrix_trace(rows, require_overlap=fault == 'slow', tiled=pipeline == 'tile_fifo')
+            if wide and pipeline == 'tile_fifo':
+                for stage in (0, 1, 2):
+                    assert any(e['stage'] == stage and e['compute_start'] < e['read_end']
+                               for row in rows for e in row['stages'] if e['compute_start']), \
+                        f'stage {stage} must start before its entire matrix finishes'
         if slots == 8 and not run.returncode and fault in ('', 'threads2', 'threads4', 'large_chunk'):
             stats = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
             if not os.environ.get('MOE_TEST_NO_REPEAT'):
@@ -218,8 +237,8 @@ def main():
             for row in stats:
                 if row['status']:
                     continue
-                expected = (row['cache_misses_total'] - previous_misses) * 3 * 128 * 256 * 4
-                if pipeline == 'matrix_fifo':
+                expected = (row['cache_misses_total'] - previous_misses) * 3 * 128 * h * 4
+                if pipeline in ('matrix_fifo', 'tile_fifo'):
                     if encoding == 'raw':
                         assert row['read_bytes_total'] - previous_bytes == expected
                     else:

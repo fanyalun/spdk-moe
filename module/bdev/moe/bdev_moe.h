@@ -13,6 +13,7 @@ struct moe_create_opts {
 	unsigned io_size, io_depth, prefetch;
 	int compute_cpu;
 	int compute_threads;
+	unsigned compute_tile_cols;
 };
 
 typedef void (*moe_create_done)(void *arg, int status);

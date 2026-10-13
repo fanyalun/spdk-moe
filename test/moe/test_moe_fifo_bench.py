@@ -20,6 +20,7 @@ PARSER = argparse.ArgumentParser(description='50-request AIO comparison; reimpor
 PARSER.add_argument('config', type=Path, help='Authorized existing AIO scratch-image configuration')
 PARSER.add_argument('output', type=Path)
 PARSER.add_argument('--encoding-comparison', action='store_true')
+PARSER.add_argument('--tile-comparison', action='store_true')
 ARGS = PARSER.parse_args()
 OUT = ARGS.output.resolve()
 BASE = ARGS.config.resolve()
@@ -42,6 +43,10 @@ if ARGS.encoding_comparison:
              for label, encoding in [('raw_fifo8', 'raw'), ('lattice8', 'lattice'),
                  ('lattice8_repeat1', 'lattice'), ('raw_fifo8_repeat1', 'raw'),
                  ('raw_fifo8_repeat2', 'raw'), ('lattice8_repeat2', 'lattice')]]
+if ARGS.tile_comparison:
+    COMMON.update(cache_slots=8, pipeline='matrix_fifo', weight_encoding='lattice')
+    CASES = [('matrix_fifo', {})] + [(f'tile{cols}', dict(pipeline='tile_fifo', compute_tile_cols=cols))
+                                    for cols in (64, 128, 256, 512)]
 
 
 def cpu_stat():
@@ -144,7 +149,7 @@ def main():
                 latencies = sorted(row['latency_ns'] / 1000000 for row in rows)
                 env = dict(os.environ, MOE_INITIATOR_CPU_MASK='0x1')
                 with (OUT / f'{label}_accuracy.log').open('w') as accuracy_log:
-                    subprocess.run([str(ACCURACY), '50' if label in ('fifo8', 'lattice8') else '1', '4242'], stdout=accuracy_log,
+                    subprocess.run([str(ACCURACY), '50' if label in ('fifo8', 'lattice8', 'tile64') else '1', '4242'], stdout=accuracy_log,
                         stderr=subprocess.STDOUT, env=env, timeout=1200, check=True)
                 stat_after = cpu_stat()
                 item = dict(label=label, parameters=params, request_count=COUNT,

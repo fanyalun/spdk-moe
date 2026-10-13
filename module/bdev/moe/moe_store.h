@@ -23,6 +23,7 @@ struct moe_layout {
 
 struct moe_store;
 typedef void (*moe_store_done)(void *arg, int status);
+typedef void (*moe_store_progress)(void *arg, uint64_t ready_bytes);
 
 struct moe_matrix_read {
 	int expert;
@@ -31,6 +32,7 @@ struct moe_matrix_read {
 	moe_store_done done;
 	void *arg;
 	uint64_t *first_submit_ticks;
+	moe_store_progress progress;
 };
 
 struct moe_store_read {
@@ -44,6 +46,8 @@ struct moe_store_read {
 	bool active;
 	moe_store_done done;
 	void *arg;
+	moe_store_progress progress;
+	uint64_t ready_mask, ready_bytes;
 };
 
 struct moe_store_op {

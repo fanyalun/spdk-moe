@@ -120,6 +120,33 @@ int moe_expert_stage(struct moe_workspace *ws, enum moe_stage stage,
     }
 }
 
+int moe_expert_slice(struct moe_workspace *ws, enum moe_stage stage, const float *weight,
+                     float *gate, float *up, float *output, unsigned first, unsigned count)
+{
+    unsigned total = stage == MOE_STAGE_DOWN ? ws->d_model : ws->d_ff;
+    unsigned rows = stage == MOE_STAGE_DOWN ? ws->d_ff : ws->d_model;
+    if ((stage != MOE_STAGE_GATE && stage != MOE_STAGE_UP && stage != MOE_STAGE_DOWN) ||
+        !count || first % MOE_PACK_COLS || first >= total ||
+        count > total - first || (count % MOE_PACK_COLS && first + count != total)) {
+        return -EINVAL;
+    }
+    const float *input = stage == MOE_STAGE_DOWN ? gate : ws->input;
+    float *dest = stage == MOE_STAGE_GATE ? gate : stage == MOE_STAGE_UP ? up : output;
+    moe_trace_push_slice(stage == MOE_STAGE_GATE ? "GATE" : stage == MOE_STAGE_UP ? "UP" : "DOWN",
+                         stage, first, count);
+    matvec_ordered(input, weight + (size_t)first * rows, rows, count,
+                   dest + first, ws->kernel, 1);
+    moe_trace_pop();
+    if (stage == MOE_STAGE_UP) {
+        moe_trace_push_slice("SILU_MULTIPLY", stage, first, count);
+        for (unsigned i = first; i < first + count; i++) {
+            gate[i] = silu(gate[i]) * up[i];
+        }
+        moe_trace_pop();
+    }
+    return stage == MOE_STAGE_DOWN ? finite_vector(output + first, count) : 0;
+}
+
 int moe_expert(struct moe_workspace *ws, const float *gate, const float *up,
                const float *down, int selected, int packed)
 {

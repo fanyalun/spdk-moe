@@ -12,6 +12,10 @@
 #define D 2048
 #define H 7168
 #define N 256
+#elif defined(MOE_WIDE_TEST)
+#define D 128
+#define H 4096
+#define N 9
 #else
 #define D 128
 #define H 256

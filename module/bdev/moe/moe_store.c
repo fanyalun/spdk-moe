@@ -459,7 +459,9 @@ static void
 read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 {
 	struct moe_store_op *op = arg;
-	struct moe_store *s = op->read->store;
+	struct moe_store_read *r = op->read;
+	struct moe_store *s = r->store;
+	uint64_t offset = op->offset;
 
 	moe_trace_end(op->trace_id);
 	spdk_bdev_free_io(io);
@@ -482,6 +484,17 @@ read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 		moe_trace_pop();
 	}
 	read_finish_op(op, status);
+	if (!status && !r->status && r->progress) {
+		r->ready_mask |= UINT64_C(1) << (offset / MOE_STORE_MIB);
+		uint64_t previous = r->ready_bytes;
+		while (r->ready_bytes < r->length &&
+		       (r->ready_mask & (UINT64_C(1) << (r->ready_bytes / MOE_STORE_MIB)))) {
+			r->ready_bytes = spdk_min(r->length, r->ready_bytes + MOE_STORE_MIB);
+		}
+		if (r->ready_bytes != previous) {
+			r->progress(r->arg, r->ready_bytes);
+		}
+	}
 	store_pump(s);
 }
 
@@ -638,6 +651,10 @@ moe_store_read_batch(struct moe_store *s, const struct moe_matrix_read *reads, u
 		    reads[i].matrix > 2 || !reads[i].buffer || !reads[i].done) {
 			return -EINVAL;
 		}
+		uint64_t length = reads[i].matrix == 2 ? s->layout.down_bytes : s->layout.gate_bytes;
+		if (reads[i].progress && (s->io_size != MOE_STORE_MIB || length > 64 * MOE_STORE_MIB)) {
+			return -ENOTSUP;
+		}
 	}
 	s->cancel_batch_on_error = true;
 	for (unsigned i = 0; i < count; i++) {
@@ -648,6 +665,7 @@ moe_store_read_batch(struct moe_store *s, const struct moe_matrix_read *reads, u
 		s->reads[i] = (struct moe_store_read){
 			.store = s, .buffer = item->buffer, .active = true,
 			.done = item->done, .arg = item->arg,
+			.progress = item->progress,
 			.first_submit_ticks = item->first_submit_ticks,
 			.offset = s->layout.expert_offset +
 				  (uint64_t)item->expert * s->layout.expert_stride +

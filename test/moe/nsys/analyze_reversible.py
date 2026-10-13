@@ -35,10 +35,11 @@ def analyze(directory):
     clients = load_rows(directory / 'lattice_requests.jsonl')
     manifest = json.loads((directory / 'manifest.json').read_text())
     warmup = manifest['warmup_count']
+    accuracy_count = manifest.get('accuracy_count', 1)
     windowed = len(requests) == len(clients)
-    if len(clients) != manifest['count'] or (not windowed and len(requests) != warmup + len(clients) + 1):
+    if len(clients) != manifest['count'] or (not windowed and len(requests) != warmup + len(clients) + accuracy_count):
         raise ValueError('NVTX request count differs from warmup + timed + accuracy')
-    if len(diagnostics) != warmup + len(clients) + 1 or any(row['status'] for row in diagnostics):
+    if len(diagnostics) != warmup + len(clients) + accuracy_count or any(row['status'] for row in diagnostics):
         raise ValueError('diagnostic request count/status mismatch')
     rows = []
     previous_bytes = previous_decoded = previous_misses = 0

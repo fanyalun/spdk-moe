@@ -15,7 +15,10 @@ def main():
     parser.add_argument('--nsys', required=True)
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--accuracy-count', type=int, default=1)
     args = parser.parse_args()
+    if not 1 <= args.accuracy_count <= 50:
+        parser.error('--accuracy-count must be between 1 and 50')
     root = Path(__file__).resolve().parents[3]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -25,7 +28,8 @@ def main():
             if entry['method'] == 'bdev_moe_create':
                 if entry['params']['backend'] != 'aio':
                     raise ValueError('Local capture requires authorized AIO scratch configuration')
-                entry['params'].update(pipeline='matrix_fifo', weight_encoding='lattice',
+                pipeline = 'tile_fifo' if entry['params'].get('pipeline') == 'tile_fifo' else 'matrix_fifo'
+                entry['params'].update(pipeline=pipeline, weight_encoding='lattice',
                     cache_slots=8, io_size=1048576, diagnostics=str(output / 'lattice.jsonl'))
     config_path = output / 'lattice.json'
     config_path.write_text(json.dumps(config, indent=2))
@@ -42,6 +46,7 @@ def main():
         str(target), '--no-huge', '--no-pci', '-c', str(config_path), '-m', '0x400',
         '-s', '1664', '-r', sock]
     manifest = dict(command=command, warmup_count=16, warmup_seed=777, count=50, seed=42,
+        accuracy_count=args.accuracy_count,
         nsys_version=subprocess.check_output([args.nsys, '--version'], text=True).strip(),
         revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         target_sha256=hashlib.sha256(target.read_bytes()).hexdigest())
@@ -82,7 +87,8 @@ def main():
             print('Independent TCP accuracy check', flush=True)
             with (output / 'lattice_accuracy.log').open('w') as accuracy_log:
                 subprocess.run([str(root / 'test/moe/accuracy_initiator/moe_accuracy_initiator'),
-                    '1', '4242'], stdout=accuracy_log, stderr=subprocess.STDOUT, check=True, timeout=300)
+                    str(args.accuracy_count), '4242'], stdout=accuracy_log, stderr=subprocess.STDOUT,
+                    check=True, timeout=1200)
             manifest['accuracy_passed'] = True
         finally:
             if profiler.poll() is None:

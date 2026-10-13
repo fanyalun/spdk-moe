@@ -20,6 +20,8 @@ enum moe_stage { MOE_STAGE_GATE, MOE_STAGE_UP, MOE_STAGE_DOWN };
 
 int moe_expert_stage(struct moe_workspace *ws, enum moe_stage stage,
                      const float *weight, float *gate, float *up, float *output, int packed);
+int moe_expert_slice(struct moe_workspace *ws, enum moe_stage stage, const float *weight,
+                     float *gate, float *up, float *output, unsigned first, unsigned count);
 
 int moe_expert(struct moe_workspace *ws, const float *gate, const float *up,
                const float *down, int selected, int packed);

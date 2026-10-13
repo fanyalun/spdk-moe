@@ -108,6 +108,22 @@ moe_trace_pop(void)
 }
 
 static inline void
+moe_trace_push_slice(const char *operation, int stage, unsigned first, unsigned count)
+{
+	char label[320], suffix[160];
+	nvtxEventAttributes_t event;
+	moe_trace_event(operation, moe_trace_get_expert(), stage, count,
+			label, sizeof(label), &event);
+	char *meta = strstr(label, " | meta:");
+	snprintf(suffix, sizeof(suffix), "%s", meta);
+	*meta = '\0';
+	size_t used = strlen(label);
+	snprintf(label + used, sizeof(label) - used, " / channels=%u..%u%s",
+		 first, first + count - 1, suffix);
+	nvtxRangePushEx(&event);
+}
+
+static inline void
 moe_trace_name_thread(const char *name)
 {
 	nvtxNameOsThreadA((uint32_t)gettid(), name);
@@ -145,6 +161,8 @@ static inline void moe_trace_push(const char *operation, int expert, int stage, 
 static inline void moe_trace_pop(void) {}
 static inline void moe_trace_name_thread(const char *name) {}
 static inline void moe_trace_capture(uint64_t request, bool begin) {}
+static inline void moe_trace_push_slice(const char *operation, int stage, unsigned first,
+		unsigned count) {}
 static inline void moe_trace_set_expert(int expert) {}
 static inline int moe_trace_get_expert(void) { return -1; }
 #endif
