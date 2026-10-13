@@ -113,6 +113,7 @@ def main():
              ('file', 1, 'matrix_reject'), ('aio', 7, 'bad_pipeline'),
              ('aio', 7, 'short_source')]
     encoding = os.environ.get('MOE_TEST_ENCODING', 'raw')
+    warmup = int(os.environ.get('MOE_TEST_STARTUP_WARMUP', '0'))
     selected_case = os.environ.get('MOE_TEST_CASE')
     if os.environ.get('MOE_TEST_FIFO') or os.environ.get('MOE_TEST_TILE'):
         cases = [('aio', 8, fault) for fault in ('', 'threads2', 'threads4',
@@ -120,6 +121,9 @@ def main():
                  'bad_gate', 'bad_up', 'bad_down')] + [('aio', 7, 'fifo_reject')]
     if encoding == 'lattice':
         cases = [case for case in cases if case[2] != 'large_chunk']
+    cases.append(('aio', 8, 'warmup_failure'))
+    cases.append(('aio', 8, 'warmup_retry'))
+    cases.append(('aio', 8, 'warmup_alloc_retry'))
     if selected_case is not None:
         cases = [case for case in cases if case[2] == selected_case]
         if not cases:
@@ -127,7 +131,8 @@ def main():
     for backend, slots, fault, pipeline in [
         (*case, mode) for case in cases
         for mode in (['tile_fifo'] if os.environ.get('MOE_TEST_TILE') else
-                     ['matrix_fifo'] if os.environ.get('MOE_TEST_FIFO') else
+                     ['matrix_fifo'] if os.environ.get('MOE_TEST_FIFO') or
+                     case[2] in ('warmup_retry', 'warmup_alloc_retry') else
                      ['matrix'] if case[2] == 'short_source' else
                      ['expert', 'matrix'] if case[0] == 'aio' else ['expert'])]:
         label = f'{backend}_{slots}_{fault or "normal"}_{pipeline}'
@@ -139,6 +144,9 @@ def main():
                       d_model=128, d_ff=h, num_experts=9, top_k=8, cache_slots=slots,
                       diagnostics=str(artifacts / f'{label}_stats.jsonl'))
         params['pipeline'] = pipeline
+        startup_retry = fault in ('warmup_retry', 'warmup_alloc_retry')
+        if warmup != 16 and fault != 'warmup_failure' and not startup_retry:
+            params['warmup_requests'] = warmup
         params['weight_encoding'] = encoding
         if pipeline == 'tile_fifo':
             params['compute_tile_cols'] = int(os.environ.get('MOE_TEST_TILE_COLS', '128'))
@@ -166,13 +174,25 @@ def main():
             params['pipeline'] = 'matrix'
         if fault == 'bad_pipeline':
             params['pipeline'] = 'invalid'
+        originals = {}
         if fault == 'short_source':
-            (weights / 'W_gate_0_128x256.bin').write_bytes(b'\0' * 4)
+            path = weights / f'W_gate_0_128x{h}.bin'
+            originals[path] = path.read_bytes()
+            path.write_bytes(b'\0' * 4)
+        if fault == 'warmup_failure':
+            for expert in range(9):
+                path = weights / f'W_gate_{expert}_128x{h}.bin'
+                originals[path] = path.read_bytes()
+                path.write_bytes(struct.pack('<f', math.nan) + originals[path][4:])
         config.append(dict(method='bdev_moe_create', params=params))
         config_path = artifacts / f'{label}.json'
         config_path.write_text(json.dumps(dict(subsystems=[dict(subsystem='bdev', config=config)])))
         log = artifacts / f'{label}.log'
         environment = dict(os.environ, MOE_TEST_WEIGHTS=str(weights))
+        if startup_retry:
+            environment['MOE_TEST_STARTUP_WARMUP'] = '16'
+            environment['MOE_TEST_STARTUP_READ_FAIL' if fault == 'warmup_retry' else
+                        'MOE_TEST_STARTUP_ALLOC_FAIL'] = '1'
         if slots == 8 and fault not in ('truncate', 'remove') and not os.environ.get('MOE_TEST_NO_REPEAT'):
             environment['MOE_TEST_REPEAT_INPUT'] = '1'
         if fault in ('bad_gate', 'bad_up', 'bad_down'):
@@ -211,11 +231,30 @@ def main():
             else:
                 run = subprocess.run(command, env=environment, stdout=output,
                                      stderr=subprocess.STDOUT, timeout=60)
+        for path, original in originals.items():
+            path.write_bytes(original)
         print(f'{label} exit={run.returncode} log={log}', flush=True)
-        if bool(run.returncode) != (fault in ('strict', 'short_source', 'matrix_reject', 'bad_pipeline', 'fifo_reject')):
+        if bool(run.returncode) != (fault in ('strict', 'short_source', 'matrix_reject', 'bad_pipeline', 'fifo_reject', 'warmup_failure')):
             print(log.read_text()[-10000:])
             return 1
-        if backend == 'aio' and fault not in ('truncate', 'strict', 'short_source', 'bad_pipeline', 'fifo_reject'):
+        if fault == 'warmup_failure':
+            assert 'MoE startup warmup failed:' in log.read_text()
+            assert 'moe_test_ready=1' not in log.read_text()
+            assert log.read_text().count('MoE startup retry:') == 1
+        elif (warmup or startup_retry) and not run.returncode:
+            text = log.read_text()
+            marker = f'MoE startup warmup completed: requests={16 if startup_retry else warmup} '
+            assert text.index(marker) < text.index('moe_test_ready=1')
+            assert 'startup_output_reset=1' in text
+            if startup_retry:
+                assert text.count('MoE startup retry:') == 1
+                assert 'cache_slots=8->7 pipeline=matrix' in text
+                assert ('startup_read_failure_injected=1' if fault == 'warmup_retry' else
+                        'startup_allocation_failure_injected=1') in text
+            stats = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
+            assert len(stats) == int(os.environ.get('MOE_TEST_ROUNDS', '32')) + 1
+            assert stats[0]['request'] == 1
+        if backend == 'aio' and fault not in ('truncate', 'strict', 'short_source', 'bad_pipeline', 'fifo_reject', 'warmup_failure'):
             check_layout(image, weights, encoding, h)
         if fault == 'short_source':
             with image.open('rb') as stream:
@@ -223,8 +262,11 @@ def main():
             assert header[2] == 0, 'failed import must remain incomplete'
         if pipeline in ('matrix', 'matrix_fifo', 'tile_fifo') and not run.returncode:
             rows = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
-            check_matrix_trace(rows, require_overlap=fault == 'slow', tiled=pipeline == 'tile_fifo')
-            if wide and pipeline == 'tile_fifo':
+            check_matrix_trace(rows, require_overlap=fault == 'slow',
+                               tiled=pipeline == 'tile_fifo' and not startup_retry)
+            if startup_retry:
+                assert all(row['pipeline'] == 'matrix' for row in rows)
+            if wide and pipeline == 'tile_fifo' and not startup_retry:
                 for stage in (0, 1, 2):
                     assert any(e['stage'] == stage and e['compute_start'] < e['read_end']
                                for row in rows for e in row['stages'] if e['compute_start']), \
@@ -232,7 +274,8 @@ def main():
         if slots == 8 and not run.returncode and fault in ('', 'threads2', 'threads4', 'large_chunk'):
             stats = [json.loads(line) for line in (artifacts / f'{label}_stats.jsonl').read_text().splitlines()]
             if not os.environ.get('MOE_TEST_NO_REPEAT'):
-                assert stats[1]['cache_hits_total'] == 8, 'repeated input must fully hit eight cached experts'
+                assert stats[1]['cache_hits_total'] - stats[0]['cache_hits_total'] == 8, \
+                    'repeated input must fully hit eight cached experts'
             previous_bytes = previous_misses = 0
             for row in stats:
                 if row['status']:

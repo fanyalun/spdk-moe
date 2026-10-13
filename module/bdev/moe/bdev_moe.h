@@ -14,6 +14,7 @@ struct moe_create_opts {
 	int compute_cpu;
 	int compute_threads;
 	unsigned compute_tile_cols;
+	unsigned warmup_requests;
 };
 
 typedef void (*moe_create_done)(void *arg, int status);

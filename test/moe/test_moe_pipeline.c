@@ -284,8 +284,23 @@ load(const char *dir, const char *name, int expert, size_t count)
 }
 
 static void
+startup_read_done(struct spdk_bdev_io *io, bool success, void *arg)
+{
+	spdk_bdev_free_io(io);
+	for (int i = 0; i < D; i++) {
+		if (!success || g_output[i] != 0.0f) {
+			finish(1);
+			return;
+		}
+	}
+	puts("startup_output_reset=1");
+	send_request();
+}
+
+static void
 started(void *arg)
 {
+	puts("moe_test_ready=1");
 	const char *dir = getenv("MOE_TEST_WEIGHTS");
 	const char *rounds = getenv("MOE_TEST_ROUNDS");
 	if (rounds) {
@@ -316,7 +331,15 @@ started(void *arg)
 		finish(1);
 		return;
 	}
-	send_request();
+	const char *warmup = getenv("MOE_TEST_STARTUP_WARMUP");
+	if (warmup && strcmp(warmup, "0")) {
+		if (spdk_bdev_read(g_desc, g_channel, g_output, 0, D * sizeof(float),
+				   startup_read_done, NULL)) {
+			finish(1);
+		}
+	} else {
+		send_request();
+	}
 }
 
 int

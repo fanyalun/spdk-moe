@@ -50,6 +50,8 @@ struct moe_bdev {
 	bool matrix_fifo;
 	bool tile_fifo;
 	unsigned compute_tile_cols;
+	unsigned warmup_requests, warmup_done, warmup_retries;
+	uint32_t warmup_state;
 	float *intermediate;
 	bool packed, store_open, output_valid, worker_busy, worker_stop, worker_started;
 	bool closing, scheduling, reschedule;
@@ -92,6 +94,7 @@ static struct spdk_bdev_module g_moe_if = {
 SPDK_BDEV_MODULE_REGISTER(moe, &g_moe_if)
 
 static void request_schedule(struct moe_bdev *moe);
+static void warmup_next(void *arg);
 
 static void
 complete_on_origin(void *arg)
@@ -137,7 +140,7 @@ request_finish(struct moe_bdev *moe)
 		}
 		moe->cache.entries[i].refs = 0;
 	}
-	if (moe->diagnostics) {
+	if (moe->diagnostics && !r->warmup) {
 		fprintf(moe->diagnostics,
 			"{\"request\":%" PRIu64 ",\"status\":%d,\"ticks_hz\":%" PRIu64
 			",\"total_ticks\":%" PRIu64 ",\"route_ticks\":%" PRIu64
@@ -188,6 +191,12 @@ request_finish(struct moe_bdev *moe)
 		r->wait_trace = 0;
 	}
 	moe_trace_end(r->trace_id);
+	if (r->warmup) {
+		r->warmup = false;
+		moe->warmup_done += r->status == 0;
+		spdk_thread_send_msg(moe->owner, warmup_next, moe);
+		return;
+	}
 	moe_trace_capture(moe->sequence, false);
 	r->io = NULL;
 	complete_io(io, r->status);
@@ -755,7 +764,7 @@ request_schedule(struct moe_bdev *moe)
 	moe->scheduling = true;
 	do {
 		moe->reschedule = false;
-		if (!r->io) {
+		if (!r->io && !r->warmup) {
 			break;
 		}
 		if (moe->closing || (moe->packed && atomic_load(&moe->store.removed))) {
@@ -1040,6 +1049,10 @@ bdev_moe_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 				     moe->tile_fifo ? "tile_fifo" : moe->matrix_fifo ? "matrix_fifo" :
 				     moe->matrix_pipeline ? "matrix" : "expert");
 	spdk_json_write_named_uint32(w, "compute_tile_cols", moe->compute_tile_cols);
+	spdk_json_write_named_uint32(w, "warmup_requests", moe->warmup_requests);
+	spdk_json_write_named_uint32(w, "warmup_completed", moe->warmup_done);
+	spdk_json_write_named_uint32(w, "warmup_retries", moe->warmup_retries);
+	spdk_json_write_named_int32(w, "cache_slots", moe->cache.capacity);
 	spdk_json_write_named_int32(w, "compute_threads", moe->compute_threads);
 	spdk_json_write_named_bool(w, "prefetch_ignored", moe->matrix_fifo);
 	spdk_json_write_named_string(w, "weight_encoding", moe->store.lattice ? "lattice" : "raw");
@@ -1061,6 +1074,7 @@ bdev_moe_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w
 				     moe->tile_fifo ? "tile_fifo" : moe->matrix_fifo ? "matrix_fifo" :
 				     moe->matrix_pipeline ? "matrix" : "expert");
 	spdk_json_write_named_uint32(w, "compute_tile_cols", moe->compute_tile_cols);
+	spdk_json_write_named_uint32(w, "warmup_requests", moe->warmup_requests);
 	spdk_json_write_named_string(w, "kernel", moe_kernel_name(moe->ws.kernel));
 	spdk_json_write_named_string(w, "weight_encoding", moe->store.lattice ? "lattice" : "raw");
 	if (moe->packed) {
@@ -1216,13 +1230,89 @@ start_device(struct moe_bdev *moe)
 		}
 		worker->started = true;
 	}
-	spdk_io_device_register(moe, channel_create, channel_destroy, 0, moe->bdev.name);
-	rc = spdk_bdev_register(&moe->bdev);
-	moe->registered = rc == 0;
-	if (rc) {
-		spdk_io_device_unregister(moe, NULL);
+	spdk_thread_send_msg(moe->owner, warmup_next, moe);
+	return 0;
+}
+
+static void
+startup_reduce_cache(struct moe_bdev *moe, int slots, int status)
+{
+	assert(!moe->worker_busy && !moe->extra_busy &&
+	       !moe->request.loading && !moe->store.active_io);
+	if (moe->cache.entries) {
+		struct moe_cache_entry *entry = &moe->cache.entries[slots - 1];
+		moe->cache.release(entry->buffer);
+		memset(entry, 0, sizeof(*entry));
 	}
-	return rc;
+	moe->cache.capacity = slots - 1;
+	moe->warmup_retries++;
+	moe->warmup_done = 0;
+	moe->warmup_state = 0x9e3779b9U;
+	moe->request = (struct moe_request){};
+	if (moe->matrix_fifo && moe->cache.capacity < moe->ws.top_k) {
+		moe->matrix_fifo = moe->tile_fifo = false;
+	}
+	SPDK_WARNLOG("MoE startup retry: status=%d cache_slots=%d->%d pipeline=%s; retry once\n",
+		     status, slots, moe->cache.capacity,
+		     moe->tile_fifo ? "tile_fifo" : moe->matrix_fifo ? "matrix_fifo" :
+		     moe->matrix_pipeline ? "matrix" : "expert");
+}
+
+static void
+warmup_next(void *arg)
+{
+	struct moe_bdev *moe = arg;
+	int status = moe->request.status;
+	if (moe->closing || (moe->packed && atomic_load(&moe->store.removed))) {
+		status = -ENODEV;
+	}
+	if (status && !moe->closing && !moe->warmup_retries && moe->cache.capacity > 1) {
+		startup_reduce_cache(moe, moe->cache.capacity, status);
+		spdk_thread_send_msg(moe->owner, warmup_next, moe);
+		return;
+	}
+	if (!status && moe->warmup_done < moe->warmup_requests) {
+		moe->request = (struct moe_request){.warmup = true};
+		for (int k = 0; k < moe->ws.top_k; k++) {
+			moe->request.slots[k] = -1;
+		}
+		for (int i = 0; i < moe->ws.d_model; i++) {
+			moe->warmup_state = moe->warmup_state * 1664525U + 1013904223U;
+			moe->ws.input[i] = (float)(moe->warmup_state >> 8) / 16777216.0f * 0.2f - 0.1f;
+		}
+		moe->request.start = moe->diagnostics ? spdk_get_ticks() : 0;
+		moe->request.trace_id = moe_trace_start("WARMUP", -1, -1, moe->warmup_done + 1);
+		submit_job(moe, MOE_JOB_ROUTE, 0);
+		return;
+	}
+	if (!status) {
+		SPDK_NOTICELOG("MoE startup warmup completed: requests=%u read_bytes=%" PRIu64
+			       " decoded_bytes=%" PRIu64 "; publishing device\n",
+			       moe->warmup_done, moe->packed ? moe->store.read_bytes : moe->cache.read_bytes,
+			       moe->store.decoded_bytes);
+		moe->output_valid = false;
+		memset(moe->last_output, 0, (size_t)moe->ws.d_model * sizeof(float));
+		moe->request = (struct moe_request){};
+		moe->cache.hits = moe->cache.misses = moe->cache.evictions = moe->cache.read_bytes = 0;
+		moe->store.read_bytes = moe->store.submit_count = moe->store.resource_wait_count = 0;
+		moe->store.decoded_bytes = moe->store.decode_ticks = 0;
+		moe->store.busy_ticks = moe->store.depth_ticks = moe->store.pending_idle_ticks = 0;
+		moe->store.meter_ticks = 0;
+		moe->store.peak_io = 0;
+		spdk_io_device_register(moe, channel_create, channel_destroy, 0, moe->bdev.name);
+		status = spdk_bdev_register(&moe->bdev);
+		moe->registered = status == 0;
+		if (status) {
+			spdk_io_device_unregister(moe, NULL);
+		}
+	} else {
+		SPDK_ERRLOG("MoE startup warmup failed: completed=%u/%u status=%d\n",
+			    moe->warmup_done, moe->warmup_requests, status);
+	}
+	moe->ready(moe->ready_arg, status);
+	if (status) {
+		free_resources(moe);
+	}
 }
 
 static void
@@ -1249,6 +1339,13 @@ store_ready(void *arg, int status)
 						moe->ws.d_model, moe->ws.d_ff, moe->directory,
 						moe->store.layout.gate_bytes,
 						moe->store.layout.expert_stride, dma_allocate, spdk_dma_free);
+		if (status == -ENOMEM && !moe->warmup_retries && slots > 1) {
+			startup_reduce_cache(moe, slots, status);
+			status = moe_cache_init_buffers(&moe->cache, slots - 1,
+						       moe->ws.d_model, moe->ws.d_ff, moe->directory,
+						       moe->store.layout.gate_bytes,
+						       moe->store.layout.expert_stride, dma_allocate, spdk_dma_free);
+		}
 		if (status) {
 			SPDK_ERRLOG("DMA cache allocation failed: slots=%d slot_bytes=%" PRIu64
 				    " pool_budget=1536MiB; pool is not expanded\n",
@@ -1257,6 +1354,9 @@ store_ready(void *arg, int status)
 	}
 	if (!status) {
 		status = start_device(moe);
+		if (!status) {
+			return;
+		}
 	}
 	moe->ready(moe->ready_arg, status);
 	if (status) {
@@ -1275,7 +1375,7 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	if (!o || !o->name || !o->backend || !o->weight_dir || !done ||
 	    o->cache_slots < 1 || o->cache_slots > 8 || o->top_k < 1 || o->top_k > MOE_REQUEST_MAX_K ||
 	    o->top_k > o->num_experts || o->d_model < 128 || o->d_model % 128 ||
-	    o->prefetch < 1 || o->prefetch > 4 ||
+	    o->prefetch < 1 || o->prefetch > 4 || o->warmup_requests > 64 ||
 	    (o->compute_threads != 1 && o->compute_threads != 2 && o->compute_threads != 4) ||
 	    moe_kernel_parse(o->kernel, &kernel)) {
 		return -EINVAL;
@@ -1284,13 +1384,13 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	bool tile = o->pipeline && !strcmp(o->pipeline, "tile_fifo");
 	bool fifo = o->pipeline ? tile || !strcmp(o->pipeline, "matrix_fifo") :
 		    packed && o->cache_slots >= o->top_k;
+	bool matrix = fifo || (o->pipeline && !strcmp(o->pipeline, "matrix"));
 	bool lattice = o->weight_encoding ? !strcmp(o->weight_encoding, "lattice") :
 		       fifo && o->io_size == MOE_STORE_MIB;
 	if ((o->weight_encoding && strcmp(o->weight_encoding, "raw") && !lattice) ||
-	    (lattice && (!fifo || o->io_size != MOE_STORE_MIB))) {
+	    (lattice && (!matrix || o->io_size != MOE_STORE_MIB))) {
 		return -EINVAL;
 	}
-	bool matrix = fifo || (o->pipeline && !strcmp(o->pipeline, "matrix"));
 	if (tile && (o->io_size != MOE_STORE_MIB || o->compute_tile_cols < MOE_PACK_COLS ||
 		     o->compute_tile_cols > 2048 || o->compute_tile_cols % MOE_PACK_COLS)) {
 		return -EINVAL;
@@ -1342,6 +1442,8 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	moe->matrix_fifo = fifo;
 	moe->tile_fifo = tile;
 	moe->compute_tile_cols = o->compute_tile_cols;
+	moe->warmup_requests = o->warmup_requests;
+	moe->warmup_state = 0x9e3779b9U;
 	if (matrix) {
 		size_t bytes = (size_t)o->top_k * 2 * o->d_ff * sizeof(float);
 		moe->intermediate = malloc(bytes);
@@ -1439,7 +1541,6 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	if (rc) {
 		goto fail;
 	}
-	done(arg, 0);
 	return 0;
 fail:
 	free_resources(moe);

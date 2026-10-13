@@ -2,7 +2,7 @@
 
 
 def bdev_moe_create(client, name, backend, **options):
-    """Import weights and publish a MoE bdev after the final flush succeeds."""
+    """Import weights, warm up inference, then publish the MoE bdev."""
     params = dict(name=name, backend=backend)
     params.update({key: value for key, value in options.items() if value is not None})
     return client.call('bdev_moe_create', params)

@@ -6,7 +6,8 @@
 且槽位不少于 Top-K 时，使用 `matrix_fifo`；此模式在 `io_size=1048576`
 且未指定 `weight_encoding` 时默认启用 `lattice` 可逆编码。
 文件调试后端、显式 `expert`/`matrix` 模式及其他分块大小默认使用 `raw`。
-显式启用 `lattice` 要求 FIFO、槽位不少于 Top-K、1 MiB 分块，否则创建失败。
+显式启用 `lattice` 支持 `matrix`、`matrix_fifo`、`tile_fifo`，要求 1 MiB 分块。
+FIFO 模式要求槽位不少于 Top-K；降槽位重试可保留编码并切换为 `matrix`。
 
 建议正式配置写明参数，避免旧配置中的七槽位或旧流水线覆盖默认值：
 
@@ -23,7 +24,8 @@
     "weight_encoding": "lattice",
     "io_size": 1048576,
     "io_depth": 4,
-    "compute_threads": 1
+    "compute_threads": 1,
+    "warmup_requests": 16
   }
 }
 ```
@@ -32,6 +34,67 @@
 CLI 对应 `--weight-encoding lattice`；设置 `weight_encoding=raw` 可以关闭编码，
 保留 FIFO 和八槽位。`bdev_get_bdevs` 和保存配置均显示实际编码与流水线。
 修改配置后重启会重新导入权重，原始权重文件不变。
+
+## 启动预热与就绪
+
+`bdev_moe_create` 默认在导入完成后内部执行 16 次完整推理，再注册 MoE
+bdev 并返回创建成功。正常 JSON 配置依次创建 bdev、namespace、listener，
+因此 MoE 服务对外就绪和 `MoE target started` 日志都晚于预热完成。
+预热复用配置指定的计算线程、Router/Top-K、专家读取、解码、计算和聚合路径。
+输入由独立的固定 PRNG 状态生成，不依赖评测输入或权重生成种子。
+
+缓存槽位在预热后保留实际加载的 FP32 权重。预热输出清零，不能被客户端
+当作当前请求结果读取；请求序号、命中/读取/解码统计从第一个客户端请求
+开始，诊断 JSONL 不包含内部预热。Nsight 的正式请求采集窗口也不受预热
+序号影响。没有新增专家缓冲区，仍受原内存预算限制。
+
+启动缓存分配遇到 `ENOMEM`，或完整预热失败，会减少一个缓存槽位并重试
+一次。当前八槽位配置会降到七；此时 Top-8 全 miss 无法一次预留全部槽位，
+因此切换为已有的 `matrix` 流水线，计算完成后回收槽位再加载其他专家。
+盘上的无损编码不变，不重新导入或编码。预热中途失败时先排空 I/O 和计算，
+再回收槽位、从头执行预热。第二次失败仍返回创建错误，不发布就绪。
+设备移除、关闭或仅剩一个槽位时直接返回错误。
+
+`warmup_requests` 支持 0–64，0 可用于冷启动与故障实验；CLI 为
+`--warmup-requests 16`。`bdev_get_bdevs` 显示实际 `cache_slots`、
+`warmup_requests`、`warmup_completed`、`warmup_retries` 和流水线；
+保存配置记录重试后的实际槽位和模式。减少缓存槽位不改变 SPDK 的预留池大小。
+外部 benchmark 的预热步骤仍按其原逻辑执行；此前性能报告仅使用外部预热，
+不能将新增启动预热解释为已经测得的 P99 收益。
+
+验证启动顺序和一次重试：
+
+```sh
+make -C module/bdev/moe -j4
+make -C examples/moe/tgt -j4
+make -C test/moe/pipeline -j4
+MOE_TEST_STARTUP_WARMUP=16 MOE_TEST_TILE=1 MOE_TEST_TILE_COLS=512 \
+  MOE_TEST_ENCODING=lattice MOE_TEST_LATTICE_WEIGHTS=1 MOE_TEST_CASE= \
+  MOE_TEST_ROUNDS=50 python3 test/moe/test_moe_pipeline.py
+MOE_TEST_TILE=1 MOE_TEST_TILE_COLS=512 MOE_TEST_ENCODING=lattice \
+  MOE_TEST_LATTICE_WEIGHTS=1 MOE_TEST_CASE=warmup_retry MOE_TEST_ROUNDS=50 \
+  python3 test/moe/test_moe_pipeline.py
+MOE_TEST_TILE=1 MOE_TEST_TILE_COLS=512 MOE_TEST_ENCODING=lattice \
+  MOE_TEST_LATTICE_WEIGHTS=1 MOE_TEST_CASE=warmup_alloc_retry MOE_TEST_ROUNDS=50 \
+  python3 test/moe/test_moe_pipeline.py
+MOE_TEST_TILE=1 MOE_TEST_TILE_COLS=512 MOE_TEST_ENCODING=lattice \
+  MOE_TEST_LATTICE_WEIGHTS=1 MOE_TEST_CASE=warmup_failure \
+  python3 test/moe/test_moe_pipeline.py
+```
+
+故障注入仅链接进 `moe_pipeline_test`，不进入生产 target。
+测试确认预热完成日志先于 ready、首次客户端 READ 不包含预热输出、内部
+预热不占客户端请求序号，临时 I/O/分配失败可以降槽位恢复，坏权重只重试
+一次且阻止就绪。上述正常与恢复后的 50 个小尺寸独立参考比对误差均为 0。
+
+正式尺寸 2048/7168、256 专家、Top-8 的本机 AIO 验证记录位于
+`/root/moe-run-logs/startup_warmup_20261014/`。默认内部预热 16 次，
+从计算 worker 启动到预热完成约 5.44 秒；之后才出现 TCP 监听日志。
+预热读取编码数据 16,928,014,336 字节，恢复 FP32 数据 21,667,774,464 字节。
+随后 seed 4242 的 50 个独立 TCP 参考输入误差均为 0，诊断仅包含客户端
+请求 1–50，`bdev_get_bdevs` 确认完成 16 次、八槽位且没有重试。
+这是本地 CPU/AIO 正确性与就绪顺序验证，不是官方 NVMe/2 GB cgroup 验收。
+最终诊断文件在 target 关闭并刷新后验证，详见该目录的 `validation.json`。
 
 ## 编码和读取
 

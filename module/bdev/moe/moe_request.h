@@ -7,6 +7,7 @@
 
 struct moe_request {
 	struct spdk_bdev_io *io;
+	bool warmup;
 	uint64_t trace_id;
 	uint64_t wait_trace;
 	int slots[MOE_REQUEST_MAX_K];

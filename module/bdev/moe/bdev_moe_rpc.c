@@ -24,6 +24,7 @@ static const struct spdk_json_object_decoder create_decoders[] = {
 	DECODER(pipeline, spdk_json_decode_string, true),
 	DECODER(weight_encoding, spdk_json_decode_string, true),
 	DECODER(compute_tile_cols, spdk_json_decode_uint32, true),
+	DECODER(warmup_requests, spdk_json_decode_uint32, true),
 	DECODER(d_model, spdk_json_decode_int32, true),
 	DECODER(d_ff, spdk_json_decode_int32, true),
 	DECODER(num_experts, spdk_json_decode_int32, true),
@@ -81,6 +82,7 @@ rpc_bdev_moe_create(struct spdk_jsonrpc_request *request, const struct spdk_json
 		.compute_cpu = -1,
 		.compute_threads = 1,
 		.compute_tile_cols = 512,
+		.warmup_requests = 16,
 	};
 	if (!params || spdk_json_decode_object(params, create_decoders, SPDK_COUNTOF(create_decoders), &r->opts)) {
 		create_done(r, -EINVAL);
