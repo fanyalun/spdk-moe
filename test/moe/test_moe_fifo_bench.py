@@ -21,7 +21,13 @@ PARSER.add_argument('config', type=Path, help='Authorized existing AIO scratch-i
 PARSER.add_argument('output', type=Path)
 PARSER.add_argument('--encoding-comparison', action='store_true')
 PARSER.add_argument('--tile-comparison', action='store_true')
+PARSER.add_argument('--tile-cols', type=int, nargs='+', default=[64, 128, 256, 512],
+                    help='Task channel caps for --tile-comparison (multiples of 64, at most 2048)')
 ARGS = PARSER.parse_args()
+if any(cols < 64 or cols > 2048 or cols % 64 for cols in ARGS.tile_cols):
+    PARSER.error('--tile-cols values must be multiples of 64 between 64 and 2048')
+if len(set(ARGS.tile_cols)) != len(ARGS.tile_cols):
+    PARSER.error('--tile-cols values must be distinct')
 OUT = ARGS.output.resolve()
 BASE = ARGS.config.resolve()
 TARGET = ROOT / 'build/examples/moe_tgt'
@@ -46,7 +52,7 @@ if ARGS.encoding_comparison:
 if ARGS.tile_comparison:
     COMMON.update(cache_slots=8, pipeline='matrix_fifo', weight_encoding='lattice')
     CASES = [('matrix_fifo', {})] + [(f'tile{cols}', dict(pipeline='tile_fifo', compute_tile_cols=cols))
-                                    for cols in (64, 128, 256, 512)]
+                                    for cols in ARGS.tile_cols]
 
 
 def cpu_stat():
