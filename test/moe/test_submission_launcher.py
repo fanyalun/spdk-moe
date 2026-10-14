@@ -17,7 +17,8 @@ class FakeRpc:
     def __init__(self, completed=16, slots=8, encoding='lattice'):
         self.calls = []
         self.info = dict(warmup_completed=completed, cache_slots=slots,
-                         cache_memory='cpu',
+                         cache_memory='cpu', warmup_retries=int(slots == 7),
+                         compute_threads=1, decode_threads=1,
                          weight_encoding=encoding, pipeline='matrix_fifo' if slots == 8 else 'matrix')
 
     def call(self, method, **params):
@@ -34,10 +35,14 @@ class FakeRpc:
 
 class LauncherTest(unittest.TestCase):
     def test_defaults_and_command(self):
-        options = TARGET.moe_options(8)
+        options = TARGET.MOE_OPTIONS
         self.assertEqual(options['pipeline'], 'matrix_fifo')
         self.assertEqual(options['weight_encoding'], 'lattice')
         self.assertEqual(options['warmup_requests'], 16)
+        self.assertEqual(options['io_depth'], 16)
+        self.assertEqual(options['compute_threads'], 1)
+        self.assertEqual(options['decode_threads'], 1)
+        self.assertNotIn('prefetch', options)
         command = TARGET.target_command('moe_tgt', '/tmp/rpc', '0000:01:00.0', '/mnt/huge')
         self.assertIn('-A', command)
         self.assertNotIn('--no-pci', command)
@@ -45,16 +50,10 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(command[-2:], ['-s', '256'])
         self.assertEqual(TARGET.HUGE_PAGES, 128)
 
-    def test_fewer_slots_keep_encoding(self):
-        for slots in (1, 7):
-            options = TARGET.moe_options(slots)
-            self.assertEqual(options['pipeline'], 'matrix')
-            self.assertEqual(options['weight_encoding'], 'lattice')
-
     def test_publish_after_warmup_and_fallback(self):
         for actual_slots in (8, 7):
             rpc = FakeRpc(slots=actual_slots)
-            info = TARGET.publish(rpc, '0000:01:00.0', None, Path('/tmp/weights'), 8)
+            info = TARGET.publish(rpc, '0000:01:00.0', None, Path('/tmp/weights'))
             self.assertEqual(info['cache_slots'], actual_slots)
             methods = [method for method, _ in rpc.calls]
             self.assertLess(methods.index('iobuf_set_options'), methods.index('framework_start_init'))
@@ -66,7 +65,17 @@ class LauncherTest(unittest.TestCase):
         wrong_memory.info['cache_memory'] = 'dma'
         for rpc in (FakeRpc(completed=15), FakeRpc(encoding='raw'), wrong_memory):
             with self.assertRaises(RuntimeError):
-                TARGET.publish(rpc, '0000:01:00.0', None, Path('/tmp/weights'), 8)
+                TARGET.publish(rpc, '0000:01:00.0', None, Path('/tmp/weights'))
+            self.assertFalse(any(method.startswith('nvmf_') for method, _ in rpc.calls))
+
+    def test_unexpected_fallback_never_listens(self):
+        for field, value in [('cache_slots', 6), ('warmup_retries', 0),
+                             ('pipeline', 'matrix_fifo'), ('compute_threads', 2),
+                             ('decode_threads', 0)]:
+            rpc = FakeRpc(slots=7)
+            rpc.info[field] = value
+            with self.assertRaises(RuntimeError):
+                TARGET.publish(rpc, '0000:01:00.0', None, Path('/tmp/weights'))
             self.assertFalse(any(method.startswith('nvmf_') for method, _ in rpc.calls))
 
     def test_prepare_reserves_same_pool(self):

@@ -6465,27 +6465,30 @@ Every creation imports again; existing storage contents are not reused.
 Name | Type | Optional | Description
 ---- | ---- | -------- | -----------
 name | string | No | MoE bdev name
-backend | string | No | `file` for debugging, `aio` for file simulation, or strict `nvme`
-base_bdev | string | Yes | Required for aio/nvme; the base must already exist
+backend | string | No | Strict `nvme`, or `aio` for small regression tests
+base_bdev | string | No | Existing exclusive NVMe or AIO weight bdev
 weight_dir | string | Yes | Input directory, default `/tmp/moe_weights`
-kernel | string | Yes | scalar, avx2, or avx512; default AVX2 when supported
-cache_slots | number | Yes | Fixed expert buffers, default 7, range 1–8 subject to memory admission
-io_size | number | Yes | Application read chunk bytes, default 1048576
-io_depth | number | Yes | Application outstanding I/O limit, default 4, range 1–16
-prefetch | number | Yes | Concurrent expert loads, default 2, range 1–4
-compute_threads | number | Yes | 1, 2 or 4 persistent workers; file backend accepts only 1
-pipeline | string | Yes | `expert` (default) or `matrix`; matrix mode requires AIO/NVMe
-compute_cpu | number | Yes | First worker CPU; other workers use separate physical cores
+kernel | string | Yes | Fixed `avx2`; other values are rejected
+cache_slots | number | Yes | Fixed 8; startup may retry once with 7
+io_size | number | Yes | Fixed 1048576 logical encoding bytes
+io_depth | number | Yes | Fixed 16 outstanding reads
+compute_threads | number | Yes | Fixed 1
+decode_threads | number | Yes | Fixed 1 independent decoder
+pipeline | string | Yes | Fixed `matrix_fifo`; startup fallback uses `matrix`
+weight_encoding | string | Yes | Fixed `lattice`, decoded to exact FP32
+warmup_requests | number | Yes | Default 16; test-only override 0–64
+compute_cpu | number | Yes | Compute CPU; decoder uses another physical core
 diagnostics | string | Yes | Optional JSONL diagnostics file; disabled by default
 d_model | number | Yes | Test dimension, default 2048, positive multiple of 128
 d_ff | number | Yes | Test FFN dimension, default 7168
 num_experts | number | Yes | Test expert count, default 256
-top_k | number | Yes | Selected experts, default 8, maximum 8
+top_k | number | Yes | Fixed 8
 
 The result is the new bdev name. Unsupported hardware, insufficient capacity/memory,
 invalid or incomplete weights, and I/O failures return errors. NVMe mode refuses non-NVMe
-bdevs. Buffers belong to the configured SPDK DMA pool; the RPC does not enlarge it.
-See `docs/moe/async_store.md` for memory accounting and configuration examples.
+bdevs. Encoded reads use the fixed SPDK DMA pool; decoded experts use CPU memory.
+The RPC never enlarges the pool. See `docs/moe/final_profile.md` for startup recovery
+and the fixed production configuration.
 
 ### bdev_moe_delete {#rpc_bdev_moe_delete}
 

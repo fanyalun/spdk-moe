@@ -24,17 +24,6 @@ struct moe_load_context {
 
 enum moe_job { MOE_JOB_NONE, MOE_JOB_ROUTE, MOE_JOB_EXPERT, MOE_JOB_COMBINE };
 
-struct moe_expert_worker {
-	struct moe_bdev *moe;
-	struct moe_workspace ws;
-	pthread_t thread;
-	pthread_mutex_t mutex;
-	pthread_cond_t condition;
-	bool started, busy, pending, stop;
-	int selected, status;
-	uint64_t start;
-};
-
 struct moe_bdev {
 	struct spdk_bdev bdev;
 	struct spdk_thread *owner;
@@ -46,30 +35,24 @@ struct moe_bdev {
 	struct moe_load_context matrix_loads[MOE_REQUEST_MAX_K][3];
 	float *router, *last_output;
 	char *directory;
-	bool matrix_pipeline;
 	bool matrix_fifo;
-	bool tile_fifo;
-	unsigned compute_tile_cols;
 	unsigned warmup_requests, warmup_done, warmup_retries;
 	uint32_t warmup_state;
 	float *intermediate;
-	bool packed, store_open, output_valid, worker_busy, worker_stop, worker_started;
+	bool store_open, output_valid, worker_busy, worker_stop, worker_started;
 	bool closing, scheduling, reschedule;
 	bool job_ready;
 	bool registered;
 	bool ever_requested;
 	unsigned prefetch;
 	int compute_cpu;
-	int compute_threads, extra_busy, worker_cpus[4 + MOE_STORE_MAX_DECODE_THREADS];
-	unsigned decode_threads;
-	struct moe_expert_worker extra[3];
+	int worker_cpus[1 + MOE_STORE_MAX_DECODE_THREADS];
 	pthread_t worker;
 	pthread_mutex_t mutex;
 	pthread_cond_t condition;
 	enum moe_job job;
 	int selected, worker_rc;
 	uint64_t job_start, sequence;
-	uint64_t worker_load_ticks;
 	FILE *diagnostics;
 	moe_create_done ready;
 	void *ready_arg;
@@ -130,13 +113,13 @@ request_finish(struct moe_bdev *moe)
 	}
 
 	moe->output_valid = r->status == 0;
-	for (int k = 0; moe->matrix_pipeline && k < moe->ws.top_k; k++) {
+	for (int k = 0; k < moe->ws.top_k; k++) {
 		if (r->failed[k] && r->slots[k] >= 0) {
 			moe->cache.entries[r->slots[k]].state = MOE_CACHE_EMPTY;
 		}
 	}
 	for (int i = 0; i < moe->cache.capacity; i++) {
-		if (moe->matrix_pipeline && moe->cache.entries[i].state == MOE_CACHE_LOADING) {
+		if (moe->cache.entries[i].state == MOE_CACHE_LOADING) {
 			moe->cache.entries[i].state = MOE_CACHE_EMPTY;
 		}
 		moe->cache.entries[i].refs = 0;
@@ -152,9 +135,8 @@ request_finish(struct moe_bdev *moe)
 			++moe->sequence, r->status, spdk_get_ticks_hz(), spdk_get_ticks() - r->start,
 			r->route_ticks, r->expert_ticks, r->combine_ticks, r->weight_wait_ticks,
 			moe->cache.hits, moe->cache.misses,
-			moe->packed ? moe->store.read_bytes : moe->cache.read_bytes, moe->store.peak_io,
-			moe->tile_fifo ? "tile_fifo" : moe->matrix_fifo ? "matrix_fifo" :
-			moe->matrix_pipeline ? "matrix" : "expert");
+			moe->store.read_bytes, moe->store.peak_io,
+			moe->matrix_fifo ? "matrix_fifo" : "matrix");
 		bool comma = false;
 		for (int k = 0; k < moe->ws.top_k; k++) {
 			for (int stage = 0; stage < 3; stage++) {
@@ -181,13 +163,12 @@ request_finish(struct moe_bdev *moe)
 			",\"io_busy_ticks_total\":%" PRIu64 ",\"io_depth_ticks_total\":%" PRIu64
 			",\"io_pending_idle_ticks_total\":%" PRIu64
 			",\"decoded_bytes_total\":%" PRIu64 ",\"decode_ticks_total\":%" PRIu64
-			",\"tile_jobs\":%u,\"compute_tile_cols\":%u"
 			",\"decode_threads\":%u,\"decode_peak\":%u,\"decode_pending\":%u"
 			",\"codec_buffer_slots\":%u}\n",
 			first ? first - r->start : 0, moe->store.submit_count,
 			moe->store.resource_wait_count, moe->store.busy_ticks,
 			moe->store.depth_ticks, moe->store.pending_idle_ticks,
-			moe->store.decoded_bytes, moe->store.decode_ticks, r->tile_jobs, moe->compute_tile_cols,
+			moe->store.decoded_bytes, moe->store.decode_ticks,
 			moe->store.decode_threads, moe->store.decode_peak,
 			moe->store.decode_pending, moe->store.op_count);
 	}
@@ -212,30 +193,11 @@ stage_done(struct moe_bdev *moe, int selected, int status)
 {
 	struct moe_request *r = &moe->request;
 
-	if (!moe->matrix_pipeline || r->stage[selected] < 0) {
+	if (r->stage[selected] < 0) {
 		return false;
 	}
 	r->busy[selected] = false;
 	r->failed[selected] |= status != 0;
-	if (moe->tile_fifo) {
-		unsigned stage = r->stage[selected];
-		if (!status) {
-			r->tile_done[selected][stage] += r->tile_count[selected];
-			unsigned total = stage == 2 ? moe->ws.d_model : moe->ws.d_ff;
-			if (r->tile_done[selected][stage] == total) {
-				r->progress[selected] = stage + 1;
-				if (stage == 2) {
-					struct moe_cache_entry *e = &moe->cache.entries[r->slots[selected]];
-					r->computed[selected] = true;
-					r->completed++;
-					e->state = MOE_CACHE_READY;
-					e->refs = 0;
-					e->last_used = ++moe->cache.clock;
-				}
-			}
-		}
-		return true;
-	}
 	if (!status) {
 		r->progress[selected]++;
 		if (r->progress[selected] == 3) {
@@ -257,14 +219,14 @@ compute_selected(struct moe_bdev *moe, struct moe_workspace *ws, int selected)
 	struct moe_cache_entry *e = &moe->cache.entries[r->slots[selected]];
 	int stage = r->stage[selected];
 	moe_trace_push("COMPUTE", moe->ws.indices[selected],
-		       moe->matrix_pipeline ? stage : -1, 0);
+		       stage, 0);
 	moe_trace_set_expert(moe->ws.indices[selected]);
 	if (moe->diagnostics && !r->first_compute[selected]) {
 		r->first_compute[selected] = spdk_get_ticks();
 	}
 
-	if (!moe->matrix_pipeline || stage < 0) {
-		int rc = moe_expert(ws, e->w_gate, e->w_up, e->w_down, selected, moe->packed);
+	if (stage < 0) {
+		int rc = moe_expert(ws, e->w_gate, e->w_up, e->w_down, selected, 1);
 		moe_trace_pop();
 		return rc;
 	}
@@ -275,10 +237,7 @@ compute_selected(struct moe_bdev *moe, struct moe_workspace *ws, int selected)
 		r->compute_start[selected][stage] = spdk_get_ticks();
 	}
 	float *output = ws->expert_outputs + (size_t)selected * ws->d_model;
-	int rc = moe->tile_fifo ?
-		 moe_expert_slice(ws, stage, weight, gate, up, output,
-				  r->tile_first[selected], r->tile_count[selected]) :
-		 moe_expert_stage(ws, stage, weight, gate, up, output, 1);
+	int rc = moe_expert_stage(ws, stage, weight, gate, up, output, 1);
 	if (moe->diagnostics) {
 		r->compute_end[selected][stage] = spdk_get_ticks();
 	}
@@ -316,7 +275,6 @@ worker_done(void *arg)
 				if (slot >= 0) {
 					moe->cache.entries[slot].refs = 1;
 					r->ready[k] = 3;
-					r->tile_hit[k] = true;
 				}
 			}
 		}
@@ -331,8 +289,7 @@ worker_done(void *arg)
 		e->state = status ? MOE_CACHE_EMPTY : MOE_CACHE_READY;
 		e->refs = 0;
 		e->last_used = ++moe->cache.clock;
-		r->expert_ticks += elapsed - moe->worker_load_ticks;
-		r->weight_wait_ticks += moe->worker_load_ticks;
+		r->expert_ticks += elapsed;
 		r->computed[selected] = true;
 		r->completed++;
 	} else if (job == MOE_JOB_COMBINE) {
@@ -364,22 +321,12 @@ compute_worker(void *arg)
 		moe->job_ready = false;
 		pthread_mutex_unlock(&moe->mutex);
 		int rc = 0;
-		uint64_t load_ticks = 0;
 		if (job == MOE_JOB_ROUTE) {
 			moe_trace_push("ROUTE", -1, -1, 0);
 			rc = moe_route(&moe->ws, moe->ws.input, moe->router);
 			moe_trace_pop();
 		} else if (job == MOE_JOB_EXPERT) {
-			int slot = moe->request.slots[selected];
-			struct moe_cache_entry *e = &moe->cache.entries[slot];
-			if (!moe->packed && e->state == MOE_CACHE_LOADING) {
-				uint64_t start = moe->diagnostics ? spdk_get_ticks() : 0;
-				rc = moe_cache_load_file(&moe->cache, slot);
-				load_ticks = moe->diagnostics ? spdk_get_ticks() - start : 0;
-			}
-			if (!rc) {
-				rc = compute_selected(moe, &moe->ws, selected);
-			}
+			rc = compute_selected(moe, &moe->ws, selected);
 		} else {
 			moe_trace_push("COMBINE", -1, -1, 0);
 			rc = moe_combine(&moe->ws, moe->last_output);
@@ -387,7 +334,6 @@ compute_worker(void *arg)
 		}
 		pthread_mutex_lock(&moe->mutex);
 		moe->worker_rc = rc;
-		moe->worker_load_ticks = load_ticks;
 		/* Wait for the owner to acknowledge this job before accepting another one. */
 		spdk_thread_send_msg(moe->owner, worker_done, moe);
 	}
@@ -408,77 +354,6 @@ submit_job(struct moe_bdev *moe, enum moe_job job, int selected)
 	pthread_mutex_unlock(&moe->mutex);
 }
 
-static void
-extra_done(void *arg)
-{
-	struct moe_expert_worker *worker = arg;
-	struct moe_bdev *moe = worker->moe;
-	struct moe_request *r = &moe->request;
-	int selected = worker->selected;
-	struct moe_cache_entry *e = &moe->cache.entries[r->slots[selected]];
-
-	pthread_mutex_lock(&worker->mutex);
-	int status = worker->status;
-	pthread_mutex_unlock(&worker->mutex);
-	worker->busy = false;
-	moe->extra_busy--;
-	if (status) {
-		r->status = status;
-	} else if (moe->tile_fifo && r->stage[selected] == 2) {
-		unsigned first = r->tile_first[selected], count = r->tile_count[selected];
-		memcpy(moe->ws.expert_outputs + (size_t)selected * moe->ws.d_model + first,
-		       worker->ws.expert_outputs + (size_t)selected * moe->ws.d_model + first,
-		       (size_t)count * sizeof(float));
-	} else if (!moe->matrix_pipeline || r->stage[selected] < 0 || r->stage[selected] == 2) {
-		memcpy(moe->ws.expert_outputs + (size_t)selected * moe->ws.d_model,
-		       worker->ws.expert_outputs + (size_t)selected * moe->ws.d_model,
-		       (size_t)moe->ws.d_model * sizeof(float));
-	}
-if (stage_done(moe, selected, status)) {
-		if (moe->diagnostics) {
-			r->expert_ticks += spdk_get_ticks() - worker->start;
-		}
-		request_schedule(moe);
-		return;
-	}
-	r->busy[selected] = false;
-	e->state = status ? MOE_CACHE_EMPTY : MOE_CACHE_READY;
-	e->refs = 0;
-	e->last_used = ++moe->cache.clock;
-	r->computed[selected] = true;
-	r->completed++;
-	if (moe->diagnostics) {
-		r->expert_ticks += spdk_get_ticks() - worker->start;
-	}
-	request_schedule(moe);
-}
-
-static void *
-extra_worker(void *arg)
-{
-	struct moe_expert_worker *worker = arg;
-	struct moe_bdev *moe = worker->moe;
-
-	pthread_mutex_lock(&worker->mutex);
-	for (;;) {
-		while (!worker->pending && !worker->stop) {
-			pthread_cond_wait(&worker->condition, &worker->mutex);
-		}
-		if (worker->stop) {
-			break;
-		}
-		worker->pending = false;
-		int selected = worker->selected;
-		pthread_mutex_unlock(&worker->mutex);
-		int rc = compute_selected(moe, &worker->ws, selected);
-		pthread_mutex_lock(&worker->mutex);
-		worker->status = rc;
-		spdk_thread_send_msg(moe->owner, extra_done, worker);
-	}
-	pthread_mutex_unlock(&worker->mutex);
-	return NULL;
-}
-
 static bool
 submit_expert(struct moe_bdev *moe, int selected)
 {
@@ -494,39 +369,7 @@ submit_expert(struct moe_bdev *moe, int selected)
 		submit_job(moe, MOE_JOB_EXPERT, selected);
 		return true;
 	}
-	for (int i = 0; i < moe->compute_threads - 1; i++) {
-		struct moe_expert_worker *worker = &moe->extra[i];
-		if (worker->busy) {
-			continue;
-		}
-		worker->busy = true;
-		moe->extra_busy++;
-		worker->start = moe->diagnostics ? spdk_get_ticks() : 0;
-		pthread_mutex_lock(&worker->mutex);
-		worker->selected = selected;
-		memcpy(worker->ws.input, moe->ws.input, (size_t)moe->ws.d_model * sizeof(float));
-		worker->pending = true;
-		pthread_cond_signal(&worker->condition);
-		pthread_mutex_unlock(&worker->mutex);
-		return true;
-	}
 	return false;
-}
-
-static void
-expert_loaded(void *arg, int status)
-{
-	struct moe_load_context *load = arg;
-	struct moe_bdev *moe = load->moe;
-	struct moe_cache_entry *e = &moe->cache.entries[load->slot];
-
-	moe->request.loading--;
-	e->state = status ? MOE_CACHE_EMPTY : MOE_CACHE_READY;
-	if (status) {
-		moe->request.status = status;
-		e->refs = 0;
-	}
-	request_schedule(moe);
 }
 
 static void
@@ -600,18 +443,6 @@ fifo_matrix_complete(void *arg, int status)
 }
 
 static void
-fifo_matrix_progress(void *arg, uint64_t ready_bytes)
-{
-	struct moe_load_context *load = arg;
-	struct moe_bdev *moe = load->moe;
-	unsigned rows = load->matrix == 2 ? moe->ws.d_ff : moe->ws.d_model;
-	unsigned cols = load->matrix == 2 ? moe->ws.d_model : moe->ws.d_ff;
-	unsigned ready = ready_bytes / ((uint64_t)rows * MOE_PACK_COLS * sizeof(float)) * MOE_PACK_COLS;
-	moe->request.tile_ready[load->selected][load->matrix] = spdk_min(ready, cols);
-	request_schedule(moe);
-}
-
-static void
 fifo_queue_matrices(struct moe_bdev *moe)
 {
 	struct moe_request *r = &moe->request;
@@ -648,7 +479,6 @@ fifo_queue_matrices(struct moe_bdev *moe)
 				.buffer = stage == 0 ? e->w_gate : stage == 1 ? e->w_up : e->w_down,
 				.done = fifo_matrix_complete, .arg = load,
 				.first_submit_ticks = moe->diagnostics ? &r->read_submit[k][stage] : NULL,
-				.progress = moe->tile_fifo ? fifo_matrix_progress : NULL,
 			};
 		}
 	}
@@ -661,57 +491,12 @@ fifo_queue_matrices(struct moe_bdev *moe)
 }
 
 static void
-tile_schedule(struct moe_bdev *moe)
-{
-	struct moe_request *r = &moe->request;
-	for (int priority = 0; priority < 4 && !r->status; priority++) {
-		for (int k = 0; k < moe->ws.top_k; k++) {
-			if (r->computed[k] || r->busy[k] || r->slots[k] < 0) {
-				continue;
-			}
-			if (r->tile_hit[k]) {
-				if (priority != 2) {
-					continue;
-				}
-				r->stage[k] = -1;
-			} else {
-				unsigned stage = priority == 0 ? 2 : priority == 1 ? 1 : 0;
-				if (priority == 2 || (stage == 2 && r->tile_done[k][1] != (unsigned)moe->ws.d_ff)) {
-					continue;
-				}
-				unsigned ready = r->tile_ready[k][stage];
-				if (stage == 1) {
-					ready = spdk_min(ready, r->tile_done[k][0]);
-				}
-				unsigned first = r->tile_done[k][stage];
-				if (first >= ready) {
-					continue;
-				}
-				r->stage[k] = stage;
-				r->tile_first[k] = first;
-				r->tile_count[k] = spdk_min(moe->compute_tile_cols, ready - first);
-			}
-			r->busy[k] = true;
-			if (!submit_expert(moe, k)) {
-				r->busy[k] = false;
-				return;
-			}
-			r->tile_jobs++;
-		}
-	}
-}
-
-static void
 matrix_schedule(struct moe_bdev *moe)
 {
 	struct moe_request *r = &moe->request;
 
 	if (moe->matrix_fifo && !r->fifo_queued) {
 		fifo_queue_matrices(moe);
-	}
-	if (moe->tile_fifo) {
-		tile_schedule(moe);
-		return;
 	}
 	for (int k = 0; !moe->matrix_fifo && k < moe->ws.top_k && !r->status; k++) {
 		if (r->slots[k] >= 0 && r->ready[k] < 3 && !r->reading[k]) {
@@ -772,19 +557,19 @@ request_schedule(struct moe_bdev *moe)
 		if (!r->io && !r->warmup) {
 			break;
 		}
-		if (moe->closing || (moe->packed && atomic_load(&moe->store.removed))) {
+		if (moe->closing || atomic_load(&moe->store.removed)) {
 			r->status = -ENODEV;
 		}
 		if (r->status) {
 			if (moe->matrix_fifo) {
 				moe_store_cancel_reads(&moe->store, r->status);
-			} else if (moe->matrix_pipeline) {
+			} else {
 				r->loading = 0;
 				for (int k = 0; k < moe->ws.top_k; k++) {
 					r->loading += r->reading[k];
 				}
 			}
-			if (!moe->worker_busy && !moe->extra_busy && !r->loading) {
+			if (!moe->worker_busy && !r->loading) {
 				request_finish(moe);
 			}
 			break;
@@ -792,73 +577,20 @@ request_schedule(struct moe_bdev *moe)
 		if (!r->routed) {
 			break;
 		}
-		if (r->completed == moe->ws.top_k && !moe->worker_busy && !moe->extra_busy) {
+		if (r->completed == moe->ws.top_k && !moe->worker_busy) {
 			submit_job(moe, MOE_JOB_COMBINE, 0);
 			break;
 		}
-		if (moe->matrix_pipeline) {
-			matrix_schedule(moe);
-			if (!moe->worker_busy && !moe->extra_busy && r->loading && !r->wait_trace) {
-				r->wait_trace = moe_trace_start("WAIT_MATRIX", -1, -1, 0);
-			}
-			if (moe->diagnostics && !moe->worker_busy && !moe->extra_busy &&
-			    r->loading && !r->weight_wait_start) {
-				r->weight_wait_start = spdk_get_ticks();
-			}
-			if (r->status) {
-				moe->reschedule = true;
-			}
-			continue;
+		matrix_schedule(moe);
+		if (!moe->worker_busy && r->loading && !r->wait_trace) {
+			r->wait_trace = moe_trace_start("WAIT_MATRIX", -1, -1, 0);
 		}
-		/* A freed slot admits the eighth expert without requiring eight resident experts. */
-		for (int k = 0; moe->packed && k < moe->ws.top_k &&
-		     r->loading < (int)moe->prefetch; k++) {
-			if (r->computed[k] || r->slots[k] >= 0) {
-				continue;
-			}
-			int slot = moe_cache_reserve(&moe->cache, moe->ws.indices[k]);
-			if (slot < 0) {
-				break;
-			}
-			r->slots[k] = slot;
-			moe->loads[k] = (struct moe_load_context){moe, k, slot};
-			r->loading++;
-			int rc = moe_store_read_expert(&moe->store, moe->ws.indices[k],
-						moe->cache.entries[slot].buffer, expert_loaded, &moe->loads[k]);
-			if (rc) {
-				expert_loaded(&moe->loads[k], rc);
-			}
-			if (r->status) {
-				break;
-			}
-		}
-		if (r->status) {
-			continue;
-		}
-		for (int k = 0; k < moe->ws.top_k; k++) {
-			if ((int)moe->worker_busy + moe->extra_busy == moe->compute_threads) {
-				break;
-			}
-			if (r->computed[k]) {
-				continue;
-			}
-			int slot = r->slots[k];
-			if (slot < 0 && !moe->packed) {
-				slot = moe_cache_reserve(&moe->cache, moe->ws.indices[k]);
-				r->slots[k] = slot;
-			}
-			if (slot >= 0 && (moe->cache.entries[slot].state == MOE_CACHE_READY || !moe->packed)) {
-				if (moe->packed || moe->cache.entries[slot].state == MOE_CACHE_READY) {
-					moe->cache.entries[slot].state = MOE_CACHE_IN_USE;
-				}
-				bool submitted = submit_expert(moe, k);
-				assert(submitted);
-				(void)submitted;
-			}
-		}
-		if (moe->diagnostics && !moe->worker_busy && !moe->extra_busy &&
+		if (moe->diagnostics && !moe->worker_busy &&
 		    r->loading && !r->weight_wait_start) {
 			r->weight_wait_start = spdk_get_ticks();
+		}
+		if (r->status) {
+			moe->reschedule = true;
 		}
 	} while (moe->reschedule);
 	moe->scheduling = false;
@@ -982,23 +714,8 @@ free_resources(struct moe_bdev *moe)
 		pthread_mutex_unlock(&moe->mutex);
 		pthread_join(moe->worker, NULL);
 	}
-	for (int i = 0; i < 3; i++) {
-		struct moe_expert_worker *worker = &moe->extra[i];
-		if (worker->started) {
-			pthread_mutex_lock(&worker->mutex);
-			worker->stop = true;
-			pthread_cond_signal(&worker->condition);
-			pthread_mutex_unlock(&worker->mutex);
-			pthread_join(worker->thread, NULL);
-		}
-		moe_workspace_destroy(&worker->ws);
-		pthread_mutex_destroy(&worker->mutex);
-		pthread_cond_destroy(&worker->condition);
-	}
 	if (moe->store_open) {
 		moe_store_close(&moe->store);
-	} else {
-		free(moe->router);
 	}
 	moe_cache_destroy(&moe->cache);
 	moe_workspace_destroy(&moe->ws);
@@ -1032,7 +749,7 @@ destruct_on_owner(void *arg)
 {
 	struct moe_bdev *moe = arg;
 	moe->closing = true;
-	assert(!moe->request.io && !moe->worker_busy && !moe->extra_busy);
+	assert(!moe->request.io && !moe->worker_busy);
 	spdk_io_device_unregister(moe, io_device_gone);
 }
 
@@ -1050,19 +767,15 @@ bdev_moe_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	struct moe_bdev *moe = ctx;
 
 	spdk_json_write_named_object_begin(w, "moe");
-	spdk_json_write_named_string(w, "pipeline",
-				     moe->tile_fifo ? "tile_fifo" : moe->matrix_fifo ? "matrix_fifo" :
-				     moe->matrix_pipeline ? "matrix" : "expert");
-	spdk_json_write_named_uint32(w, "compute_tile_cols", moe->compute_tile_cols);
+	spdk_json_write_named_string(w, "pipeline", moe->matrix_fifo ? "matrix_fifo" : "matrix");
 	spdk_json_write_named_uint32(w, "warmup_requests", moe->warmup_requests);
 	spdk_json_write_named_uint32(w, "warmup_completed", moe->warmup_done);
 	spdk_json_write_named_uint32(w, "warmup_retries", moe->warmup_retries);
 	spdk_json_write_named_int32(w, "cache_slots", moe->cache.capacity);
-	spdk_json_write_named_string(w, "cache_memory", moe->cache.cpu_memory ? "cpu" : "dma");
-	spdk_json_write_named_int32(w, "compute_threads", moe->compute_threads);
-	spdk_json_write_named_uint32(w, "decode_threads", moe->store.decode_threads);
-	spdk_json_write_named_bool(w, "prefetch_ignored", moe->matrix_fifo);
-	spdk_json_write_named_string(w, "weight_encoding", moe->store.lattice ? "lattice" : "raw");
+	spdk_json_write_named_string(w, "cache_memory", "cpu");
+	spdk_json_write_named_int32(w, "compute_threads", 1);
+	spdk_json_write_named_uint32(w, "decode_threads", 1);
+	spdk_json_write_named_string(w, "weight_encoding", "lattice");
 	spdk_json_write_object_end(w);
 	return 0;
 }
@@ -1071,37 +784,30 @@ static void
 bdev_moe_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 {
 	struct moe_bdev *moe = bdev->ctxt;
+	struct spdk_bdev *base = spdk_bdev_desc_get_bdev(moe->store.desc);
 
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w, "method", "bdev_moe_create");
 	spdk_json_write_named_object_begin(w, "params");
 	spdk_json_write_named_string(w, "name", bdev->name);
 	spdk_json_write_named_string(w, "weight_dir", moe->directory);
-	spdk_json_write_named_string(w, "pipeline",
-				     moe->tile_fifo ? "tile_fifo" : moe->matrix_fifo ? "matrix_fifo" :
-				     moe->matrix_pipeline ? "matrix" : "expert");
-	spdk_json_write_named_uint32(w, "compute_tile_cols", moe->compute_tile_cols);
+	// Replay starts with the fixed profile and may perform the same startup fallback.
+	spdk_json_write_named_string(w, "pipeline", "matrix_fifo");
 	spdk_json_write_named_uint32(w, "warmup_requests", moe->warmup_requests);
-	spdk_json_write_named_string(w, "kernel", moe_kernel_name(moe->ws.kernel));
-	spdk_json_write_named_string(w, "weight_encoding", moe->store.lattice ? "lattice" : "raw");
-	if (moe->packed) {
-		struct spdk_bdev *base = spdk_bdev_desc_get_bdev(moe->store.desc);
-		spdk_json_write_named_string(w, "backend", spdk_bdev_get_module_name(base));
-		spdk_json_write_named_string(w, "base_bdev", spdk_bdev_get_name(base));
-		spdk_json_write_named_uint32(w, "io_size", moe->store.io_size);
-		spdk_json_write_named_uint32(w, "io_depth", moe->store.io_depth);
-	} else {
-		spdk_json_write_named_string(w, "backend", "file");
-	}
+	spdk_json_write_named_string(w, "kernel", "avx2");
+	spdk_json_write_named_string(w, "weight_encoding", "lattice");
+	spdk_json_write_named_string(w, "backend", spdk_bdev_get_module_name(base));
+	spdk_json_write_named_string(w, "base_bdev", spdk_bdev_get_name(base));
+	spdk_json_write_named_uint32(w, "io_size", MOE_STORE_MIB);
+	spdk_json_write_named_uint32(w, "io_depth", 16);
 	spdk_json_write_named_int32(w, "d_model", moe->ws.d_model);
 	spdk_json_write_named_int32(w, "d_ff", moe->ws.d_ff);
 	spdk_json_write_named_int32(w, "num_experts", moe->ws.num_experts);
 	spdk_json_write_named_int32(w, "top_k", moe->ws.top_k);
-	spdk_json_write_named_int32(w, "cache_slots", moe->cache.capacity);
-	spdk_json_write_named_int32(w, "compute_threads", moe->compute_threads);
-	spdk_json_write_named_uint32(w, "decode_threads", moe->store.decode_threads);
+	spdk_json_write_named_int32(w, "cache_slots", 8);
+	spdk_json_write_named_int32(w, "compute_threads", 1);
+	spdk_json_write_named_uint32(w, "decode_threads", 1);
 	spdk_json_write_named_int32(w, "compute_cpu", moe->compute_cpu);
-	spdk_json_write_named_uint32(w, "prefetch", moe->prefetch);
 	spdk_json_write_object_end(w);
 	spdk_json_write_object_end(w);
 }
@@ -1114,13 +820,6 @@ static const struct spdk_bdev_fn_table g_moe_fn_table = {
 	.dump_info_json = bdev_moe_dump_info_json,
 	.write_config_json = bdev_moe_write_config_json,
 };
-
-static void *
-dma_allocate(size_t size)
-{
-	return spdk_dma_zmalloc_socket(size, 4096, NULL,
-				      spdk_env_get_numa_id(spdk_env_get_current_core()));
-}
 
 static int
 topology_id(int cpu, const char *field)
@@ -1230,20 +929,12 @@ start_device(struct moe_bdev *moe)
 		return rc;
 	}
 	moe->worker_started = true;
-	for (int i = 0; i < moe->compute_threads - 1; i++) {
-		struct moe_expert_worker *worker = &moe->extra[i];
-		rc = start_worker(moe, &worker->thread, extra_worker, worker, i + 1);
-		if (rc) {
-			return rc;
-		}
-		worker->started = true;
-	}
 	for (unsigned i = 0; i < moe->store.decode_threads; i++) {
 		struct moe_decode_worker *worker = &moe->store.decoders[i];
 		worker->store = &moe->store;
 		worker->index = i;
 		rc = start_worker(moe, &worker->thread, moe_store_decode_worker,
-				  worker, moe->compute_threads + i);
+				  worker, 1 + i);
 		if (rc) {
 			return rc;
 		}
@@ -1256,7 +947,7 @@ start_device(struct moe_bdev *moe)
 static void
 startup_reduce_cache(struct moe_bdev *moe, int slots, int status)
 {
-	assert(!moe->worker_busy && !moe->extra_busy &&
+	assert(!moe->worker_busy &&
 	       !moe->request.loading && !moe->store.active_io);
 	if (moe->cache.entries) {
 		struct moe_cache_entry *entry = &moe->cache.entries[slots - 1];
@@ -1268,13 +959,12 @@ startup_reduce_cache(struct moe_bdev *moe, int slots, int status)
 	moe->warmup_done = 0;
 	moe->warmup_state = 0x9e3779b9U;
 	moe->request = (struct moe_request){};
-	if (moe->matrix_fifo && moe->cache.capacity < moe->ws.top_k) {
-		moe->matrix_fifo = moe->tile_fifo = false;
+	if (moe->cache.capacity < moe->ws.top_k) {
+		moe->matrix_fifo = false;
 	}
 	SPDK_WARNLOG("MoE startup retry: status=%d cache_slots=%d->%d pipeline=%s; retry once\n",
 		     status, slots, moe->cache.capacity,
-		     moe->tile_fifo ? "tile_fifo" : moe->matrix_fifo ? "matrix_fifo" :
-		     moe->matrix_pipeline ? "matrix" : "expert");
+		     moe->matrix_fifo ? "matrix_fifo" : "matrix");
 }
 
 static void
@@ -1282,7 +972,7 @@ warmup_next(void *arg)
 {
 	struct moe_bdev *moe = arg;
 	int status = moe->request.status;
-	if (moe->closing || (moe->packed && atomic_load(&moe->store.removed))) {
+	if (moe->closing || atomic_load(&moe->store.removed)) {
 		status = -ENODEV;
 	}
 	if (status && !moe->closing && !moe->warmup_retries && moe->cache.capacity > 1) {
@@ -1307,7 +997,7 @@ warmup_next(void *arg)
 	if (!status) {
 		SPDK_NOTICELOG("MoE startup warmup completed: requests=%u read_bytes=%" PRIu64
 			       " decoded_bytes=%" PRIu64 "; publishing device\n",
-			       moe->warmup_done, moe->packed ? moe->store.read_bytes : moe->cache.read_bytes,
+			       moe->warmup_done, moe->store.read_bytes,
 			       moe->store.decoded_bytes);
 		moe->output_valid = false;
 		memset(moe->last_output, 0, (size_t)moe->ws.d_model * sizeof(float));
@@ -1355,18 +1045,10 @@ store_ready(void *arg, int status)
 		moe->router = moe->store.router;
 		int slots = moe->cache.capacity;
 		for (int attempt = 0; attempt < 2; attempt++) {
-			if (moe->store.lattice) {
-				status = moe_cache_init_cpu_buffers(&moe->cache, slots - attempt,
-								   moe->ws.d_model, moe->ws.d_ff, moe->directory,
-								   moe->store.layout.gate_bytes,
-								   moe->store.layout.expert_stride);
-			} else {
-				status = moe_cache_init_buffers(&moe->cache, slots - attempt,
-							       moe->ws.d_model, moe->ws.d_ff, moe->directory,
-							       moe->store.layout.gate_bytes,
-							       moe->store.layout.expert_stride,
-							       dma_allocate, spdk_dma_free);
-			}
+			status = moe_cache_init_cpu_buffers(&moe->cache, slots - attempt,
+							   moe->ws.d_model, moe->ws.d_ff, moe->directory,
+							   moe->store.layout.gate_bytes,
+							   moe->store.layout.expert_stride);
 			if (status != -ENOMEM || attempt || moe->warmup_retries || slots <= 1) {
 				break;
 			}
@@ -1375,17 +1057,17 @@ store_ready(void *arg, int status)
 		if (status) {
 			SPDK_ERRLOG("Expert cache allocation failed: memory=%s slots=%d slot_bytes=%" PRIu64
 				    " status=%d; pool is not expanded\n",
-				    moe->store.lattice ? "cpu" : "dma", slots - moe->warmup_retries,
+				    "cpu", slots - moe->warmup_retries,
 				    moe->store.layout.expert_stride, status);
 		} else {
 			SPDK_NOTICELOG("Expert cache prefaulted: memory=%s slots=%d bytes=%" PRIu64 "\n",
-				       moe->cache.cpu_memory ? "cpu (2MiB THP advised)" : "dma",
+				       "cpu (2MiB THP advised)",
 				       moe->cache.capacity,
 				       moe->cache.capacity * moe->store.layout.expert_stride);
 		}
 	}
 	if (!status) {
-		status = moe_store_set_decode_threads(&moe->store, moe->decode_threads);
+		status = moe_store_prepare_decoder(&moe->store);
 	}
 	if (!status) {
 		status = start_device(moe);
@@ -1403,50 +1085,18 @@ int
 bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, void *arg)
 {
 	struct moe_layout layout;
-	enum moe_kernel kernel;
-	bool packed;
 	int rc;
 
-	if (!o || !o->name || !o->backend || !o->weight_dir || !done ||
-	    o->cache_slots < 1 || o->cache_slots > 9 || o->top_k < 1 || o->top_k > MOE_REQUEST_MAX_K ||
-	    o->top_k > o->num_experts || o->d_model < 128 || o->d_model % 128 ||
-	    o->prefetch < 1 || o->prefetch > 4 || o->warmup_requests > 64 ||
-	    o->decode_threads > MOE_STORE_MAX_DECODE_THREADS ||
-	    (o->compute_threads != 1 && o->compute_threads != 2 && o->compute_threads != 4) ||
-	    moe_kernel_parse(o->kernel, &kernel)) {
-		return -EINVAL;
-	}
-	packed = strcmp(o->backend, "file") != 0;
-	bool tile = o->pipeline && !strcmp(o->pipeline, "tile_fifo");
-	bool fifo = o->pipeline ? tile || !strcmp(o->pipeline, "matrix_fifo") :
-		    packed && o->cache_slots >= o->top_k;
-	bool matrix = fifo || (o->pipeline && !strcmp(o->pipeline, "matrix"));
-	bool lattice = o->weight_encoding ? !strcmp(o->weight_encoding, "lattice") :
-		       fifo && o->io_size == MOE_STORE_MIB;
-	if (o->decode_threads && !lattice) {
-		return -EINVAL;
-	}
-	if (o->cache_slots > 8 && !lattice) {
-		return -EINVAL;
-	}
-	if ((o->weight_encoding && strcmp(o->weight_encoding, "raw") && !lattice) ||
-	    (lattice && (!matrix || o->io_size != MOE_STORE_MIB))) {
-		return -EINVAL;
-	}
-	if (tile && (o->io_size != MOE_STORE_MIB || o->compute_tile_cols < MOE_PACK_COLS ||
-		     o->compute_tile_cols > 2048 || o->compute_tile_cols % MOE_PACK_COLS)) {
-		return -EINVAL;
-	}
-	if (fifo && o->cache_slots < o->top_k) {
-		return -EINVAL;
-	}
-	if ((o->pipeline && strcmp(o->pipeline, "expert") && !matrix) || (matrix && !packed)) {
-		return -EINVAL;
-	}
-	if (!packed && o->compute_threads != 1) {
-		return -EINVAL;
-	}
-	if (packed && (!o->base_bdev || (strcmp(o->backend, "aio") && strcmp(o->backend, "nvme")))) {
+	if (!o || !o->name || !o->backend || !o->base_bdev || !o->weight_dir ||
+	    o->d_model <= 0 || o->d_ff <= 0 || o->num_experts < 8 || o->top_k != 8 ||
+	    o->d_model % MOE_PACK_COLS || o->d_ff % MOE_PACK_COLS ||
+	    o->cache_slots != 8 || o->io_size != MOE_STORE_MIB || o->io_depth != 16 ||
+	    o->compute_threads != 1 || o->decode_threads != 1 || o->warmup_requests > 64 ||
+	    (o->pipeline && strcmp(o->pipeline, "matrix_fifo")) ||
+	    (o->kernel && strcmp(o->kernel, "avx2")) ||
+	    (o->weight_encoding && strcmp(o->weight_encoding, "lattice")) ||
+	    (strcmp(o->backend, "nvme") && strcmp(o->backend, "aio")) ||
+	    !moe_kernel_supported(MOE_KERNEL_AVX2)) {
 		return -EINVAL;
 	}
 	if (spdk_bdev_get_by_name(o->name)) {
@@ -1456,13 +1106,13 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	if (rc) {
 		return rc;
 	}
-	uint64_t cache_bytes = layout.expert_stride * o->cache_slots;
-	uint64_t cache_budget = lattice ? UINT64_C(2000000000) - 256 * MOE_STORE_MIB :
-			       1536 * MOE_STORE_MIB;
-	if (cache_bytes + 129 * MOE_STORE_MIB > cache_budget) {
-		SPDK_ERRLOG("MoE memory admission failed: cache=%" PRIu64
-			    " reserve=129MiB cache_budget=%" PRIu64 " bytes\n", cache_bytes, cache_budget);
+	uint64_t cache_bytes = layout.expert_stride * 8;
+	if (cache_bytes + (129 + 256) * MOE_STORE_MIB > UINT64_C(2000000000)) {
 		return -ENOMEM;
+	}
+	struct spdk_bdev *base = spdk_bdev_get_by_name(o->base_bdev);
+	if (!base || strcmp(spdk_bdev_get_module_name(base), o->backend)) {
+		return -ENODEV;
 	}
 	struct moe_bdev *moe = calloc(1, sizeof(*moe));
 	if (!moe) {
@@ -1470,37 +1120,18 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	}
 	pthread_mutex_init(&moe->mutex, NULL);
 	pthread_cond_init(&moe->condition, NULL);
-	for (int i = 0; i < 3; i++) {
-		moe->extra[i].moe = moe;
-		pthread_mutex_init(&moe->extra[i].mutex, NULL);
-		pthread_cond_init(&moe->extra[i].condition, NULL);
-	}
 	moe->owner = spdk_get_thread();
 	moe->bdev.name = strdup(o->name);
 	moe->directory = strdup(o->weight_dir);
 	moe->last_output = calloc(o->d_model, sizeof(float));
+	moe->intermediate = calloc((size_t)o->top_k * 2 * o->d_ff, sizeof(float));
 	moe->ready = done;
 	moe->ready_arg = arg;
-	moe->packed = packed;
-	moe->matrix_pipeline = matrix;
-	moe->matrix_fifo = fifo;
-	moe->tile_fifo = tile;
-	moe->compute_tile_cols = o->compute_tile_cols;
+	moe->matrix_fifo = true;
 	moe->warmup_requests = o->warmup_requests;
 	moe->warmup_state = 0x9e3779b9U;
-	if (matrix) {
-		size_t bytes = (size_t)o->top_k * 2 * o->d_ff * sizeof(float);
-		moe->intermediate = malloc(bytes);
-		if (!moe->intermediate) {
-			rc = -ENOMEM;
-			goto fail;
-		}
-		memset(moe->intermediate, 0, bytes);
-	}
-	moe->prefetch = o->prefetch;
+	moe->prefetch = 2;
 	moe->compute_cpu = o->compute_cpu;
-	moe->compute_threads = o->compute_threads;
-	moe->decode_threads = o->decode_threads;
 	moe->bdev.product_name = "MoE FP32 offload";
 	moe->bdev.blocklen = (uint32_t)o->d_model * sizeof(float);
 	moe->bdev.phys_blocklen = moe->bdev.blocklen;
@@ -1508,20 +1139,14 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	moe->bdev.ctxt = moe;
 	moe->bdev.fn_table = &g_moe_fn_table;
 	moe->bdev.module = &g_moe_if;
-	if (!moe->bdev.name || !moe->directory || !moe->last_output) {
+	if (!moe->bdev.name || !moe->directory || !moe->last_output || !moe->intermediate) {
 		rc = -ENOMEM;
 		goto fail;
 	}
-	rc = moe_workspace_init(&moe->ws, o->d_model, o->d_ff, o->num_experts, o->top_k, kernel);
+	rc = moe_workspace_init(&moe->ws, o->d_model, o->d_ff, o->num_experts, o->top_k,
+				MOE_KERNEL_AVX2);
 	if (rc) {
 		goto fail;
-	}
-	for (int i = 0; i < moe->compute_threads - 1; i++) {
-		rc = moe_workspace_init(&moe->extra[i].ws, o->d_model, o->d_ff,
-					o->num_experts, o->top_k, kernel);
-		if (rc) {
-			goto fail;
-		}
 	}
 	if (o->diagnostics) {
 		moe->diagnostics = fopen(o->diagnostics, "a");
@@ -1530,61 +1155,23 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 			goto fail;
 		}
 	}
-	SPDK_NOTICELOG("MoE kernel=%s cache=%d slots bytes<=%" PRIu64 " backend=%s\n",
-		       moe_kernel_name(kernel), o->cache_slots, cache_bytes, o->backend);
-	if (packed) {
-		struct spdk_bdev *base = spdk_bdev_get_by_name(o->base_bdev);
-		if (!base || (strcmp(o->backend, "aio") == 0 &&
-			     strcmp(spdk_bdev_get_module_name(base), "aio"))) {
-			rc = -ENODEV;
-			goto fail;
-		}
-		moe->cache.capacity = o->cache_slots;
-		rc = moe_store_open(&moe->store, o->base_bdev, moe->directory, o->d_model,
-				    o->d_ff, o->num_experts, strcmp(o->backend, "nvme") == 0,
-				    o->io_size, o->io_depth, lattice, store_ready, moe);
-		if (rc) {
-			moe->cache.capacity = 0;
-			goto fail;
-		}
-		moe->store_open = true;
-		moe->store.diagnostics = moe->diagnostics != NULL;
-		moe->store.removed_cb = store_removed;
-		moe->store.removed_arg = moe;
-		rc = spdk_bdev_module_claim_bdev_desc(moe->store.desc,
-						      SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE, NULL, &g_moe_if);
-		if (rc) {
-			/* The importer is still waiting for its first owner-thread I/O message. */
-			atomic_store(&moe->store.removed, true);
-		}
-		return 0;
-	}
-	char path[4096];
-	int n = snprintf(path, sizeof(path), "%s/W_router_%dx%d.bin", o->weight_dir,
-			 o->d_model, o->num_experts);
-	if (n < 0 || (size_t)n >= sizeof(path)) {
-		rc = -ENAMETOOLONG;
-		goto fail;
-	}
-	FILE *file = fopen(path, "rb");
-	if (!file) {
-		rc = -errno;
-		goto fail;
-	}
-	moe->router = malloc(layout.router_bytes);
-	bool valid = moe->router && fread(moe->router, 1, layout.router_bytes, file) == layout.router_bytes &&
-		     fgetc(file) == EOF && !ferror(file);
-	fclose(file);
-	if (!valid) {
-		rc = -EIO;
-		goto fail;
-	}
-	rc = moe_cache_init(&moe->cache, o->cache_slots, o->d_model, o->d_ff, moe->directory);
-	if (!rc) {
-		rc = start_device(moe);
-	}
+	moe->cache.capacity = 8;
+	rc = moe_store_open(&moe->store, o->base_bdev, moe->directory, o->d_model,
+			    o->d_ff, o->num_experts, strcmp(o->backend, "nvme") == 0,
+			    MOE_STORE_MIB, 16, true, store_ready, moe);
 	if (rc) {
+		moe->cache.capacity = 0;
 		goto fail;
+	}
+	moe->store_open = true;
+	moe->store.diagnostics = moe->diagnostics != NULL;
+	moe->store.removed_cb = store_removed;
+	moe->store.removed_arg = moe;
+	rc = spdk_bdev_module_claim_bdev_desc(moe->store.desc,
+					     SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE, NULL, &g_moe_if);
+	if (rc) {
+		// The importer is still waiting for its first owner-thread I/O message.
+		atomic_store(&moe->store.removed, true);
 	}
 	return 0;
 fail:

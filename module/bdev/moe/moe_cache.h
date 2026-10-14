@@ -28,8 +28,6 @@ struct moe_cache {
 	void (*release)(void *);
 };
 
-int moe_cache_init(struct moe_cache *cache, int capacity, int d_model, int d_ff,
-		   const char *weight_dir);
 int moe_cache_init_buffers(struct moe_cache *cache, int capacity, int d_model, int d_ff,
 			   const char *directory, size_t gate_bytes, size_t buffer_bytes,
 			   void *(*allocate)(size_t), void (*release)(void *));
@@ -37,9 +35,6 @@ int moe_cache_init_cpu_buffers(struct moe_cache *cache, int capacity, int d_mode
 			       const char *directory, size_t gate_bytes, size_t buffer_bytes);
 int moe_cache_find(struct moe_cache *cache, int expert_id);
 int moe_cache_reserve(struct moe_cache *cache, int expert_id);
-int moe_cache_load_file(struct moe_cache *cache, int slot);
-int moe_cache_get(struct moe_cache *cache, int expert_id,
-		  const float **w_gate, const float **w_up, const float **w_down);
 void moe_cache_destroy(struct moe_cache *cache);
 
 #endif

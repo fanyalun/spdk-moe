@@ -11,9 +11,9 @@
 #include "moe_codec.h"
 
 #define MOE_STORE_MIB (1024ULL * 1024)
-#define MOE_STORE_MAX_IO 64
+#define MOE_STORE_MAX_IO 16
 #define MOE_STORE_MAX_READS 24
-#define MOE_STORE_MAX_DECODE_THREADS 8
+#define MOE_STORE_MAX_DECODE_THREADS 1
 #define MOE_STORE_MAX_OPS (2 * MOE_STORE_MAX_IO)
 
 struct moe_layout {
@@ -25,7 +25,6 @@ struct moe_layout {
 
 struct moe_store;
 typedef void (*moe_store_done)(void *arg, int status);
-typedef void (*moe_store_progress)(void *arg, uint64_t ready_bytes);
 
 struct moe_matrix_read {
 	int expert;
@@ -34,7 +33,6 @@ struct moe_matrix_read {
 	moe_store_done done;
 	void *arg;
 	uint64_t *first_submit_ticks;
-	moe_store_progress progress;
 };
 
 struct moe_store_read {
@@ -48,8 +46,6 @@ struct moe_store_read {
 	bool active;
 	moe_store_done done;
 	void *arg;
-	moe_store_progress progress;
-	uint64_t ready_mask, ready_bytes;
 };
 
 struct moe_store_op {
@@ -124,7 +120,7 @@ int moe_layout_init(struct moe_layout *layout, int d, int h, int experts, uint32
 int moe_store_open(struct moe_store *store, const char *base, const char *directory,
 		   int d, int h, int experts, bool strict_nvme, unsigned io_size,
 		   unsigned io_depth, bool lattice, moe_store_done ready, void *arg);
-int moe_store_set_decode_threads(struct moe_store *store, unsigned count);
+int moe_store_prepare_decoder(struct moe_store *store);
 void *moe_store_decode_worker(void *arg);
 int moe_store_read_expert(struct moe_store *store, int expert, void *buffer,
 			  moe_store_done done, void *arg);

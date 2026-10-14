@@ -23,7 +23,6 @@ static const struct spdk_json_object_decoder create_decoders[] = {
 	DECODER(diagnostics, spdk_json_decode_string, true),
 	DECODER(pipeline, spdk_json_decode_string, true),
 	DECODER(weight_encoding, spdk_json_decode_string, true),
-	DECODER(compute_tile_cols, spdk_json_decode_uint32, true),
 	DECODER(warmup_requests, spdk_json_decode_uint32, true),
 	DECODER(d_model, spdk_json_decode_int32, true),
 	DECODER(d_ff, spdk_json_decode_int32, true),
@@ -32,7 +31,6 @@ static const struct spdk_json_object_decoder create_decoders[] = {
 	DECODER(cache_slots, spdk_json_decode_int32, true),
 	DECODER(io_size, spdk_json_decode_uint32, true),
 	DECODER(io_depth, spdk_json_decode_uint32, true),
-	DECODER(prefetch, spdk_json_decode_uint32, true),
 	DECODER(compute_cpu, spdk_json_decode_int32, true),
 	DECODER(compute_threads, spdk_json_decode_int32, true),
 	DECODER(decode_threads, spdk_json_decode_uint32, true),
@@ -79,10 +77,10 @@ rpc_bdev_moe_create(struct spdk_jsonrpc_request *request, const struct spdk_json
 	r->request = request;
 	r->opts = (struct moe_create_opts){
 		.d_model = MOE_D_MODEL, .d_ff = MOE_D_FF, .num_experts = MOE_NUM_EXPERTS,
-		.top_k = MOE_TOP_K, .cache_slots = 8, .io_size = 1024 * 1024, .io_depth = 4, .prefetch = 2,
+		.top_k = MOE_TOP_K, .cache_slots = 8, .io_size = 1024 * 1024, .io_depth = 16,
 		.compute_cpu = -1,
 		.compute_threads = 1,
-		.compute_tile_cols = 512,
+		.decode_threads = 1,
 		.warmup_requests = 16,
 	};
 	if (!params || spdk_json_decode_object(params, create_decoders, SPDK_COUNTOF(create_decoders), &r->opts)) {

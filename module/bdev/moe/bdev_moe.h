@@ -10,11 +10,10 @@ struct moe_create_opts {
 	const char *name, *backend, *base_bdev, *weight_dir, *kernel, *diagnostics, *pipeline;
 	const char *weight_encoding;
 	int d_model, d_ff, num_experts, top_k, cache_slots;
-	unsigned io_size, io_depth, prefetch;
+	unsigned io_size, io_depth;
 	int compute_cpu;
 	int compute_threads;
 	unsigned decode_threads;
-	unsigned compute_tile_cols;
 	unsigned warmup_requests;
 };
 

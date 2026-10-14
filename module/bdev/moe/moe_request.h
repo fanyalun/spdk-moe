@@ -24,10 +24,6 @@ struct moe_request {
 	bool routed;
 	bool fifo_queued;
 	unsigned matrix_done[MOE_REQUEST_MAX_K];
-	unsigned tile_ready[MOE_REQUEST_MAX_K][3], tile_done[MOE_REQUEST_MAX_K][3];
-	unsigned tile_first[MOE_REQUEST_MAX_K], tile_count[MOE_REQUEST_MAX_K];
-	bool tile_hit[MOE_REQUEST_MAX_K];
-	unsigned tile_jobs;
 	uint64_t start, route_ticks, expert_ticks, combine_ticks;
 	uint64_t weight_wait_ticks, weight_wait_start;
 };

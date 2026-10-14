@@ -19,9 +19,6 @@ int moe_kernel_supported(enum moe_kernel kernel)
     if (kernel == MOE_KERNEL_AVX2) {
         return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
     }
-    if (kernel == MOE_KERNEL_AVX512) {
-        return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("fma");
-    }
 #endif
     return 0;
 }
@@ -31,7 +28,6 @@ const char *moe_kernel_name(enum moe_kernel kernel)
     switch (kernel) {
     case MOE_KERNEL_SCALAR: return "scalar";
     case MOE_KERNEL_AVX2: return "avx2";
-    case MOE_KERNEL_AVX512: return "avx512";
     default: return "invalid";
     }
 }
@@ -45,7 +41,7 @@ int moe_kernel_parse(const char *name, enum moe_kernel *kernel)
         *kernel = moe_kernel_supported(MOE_KERNEL_AVX2) ? MOE_KERNEL_AVX2 : MOE_KERNEL_SCALAR;
         return 0;
     }
-    for (int k = MOE_KERNEL_SCALAR; k <= MOE_KERNEL_AVX512; k++) {
+    for (int k = MOE_KERNEL_SCALAR; k <= MOE_KERNEL_AVX2; k++) {
         if (strcmp(name, moe_kernel_name(k)) == 0 && moe_kernel_supported(k)) {
             *kernel = k;
             return 0;
@@ -125,27 +121,6 @@ static void avx2_block(const float *x, const float *w, int rows, size_t stride, 
     }
 }
 
-__attribute__((target("avx512f,fma")))
-static void avx512_block(const float *x, const float *w, int rows, size_t stride, float *y)
-{
-    __m512 accum[4];
-#pragma GCC unroll 4
-    for (int v = 0; v < 4; v++) {
-        accum[v] = _mm512_setzero_ps();
-    }
-    for (int i = 0; i < rows; i++) {
-        __m512 input = _mm512_set1_ps(x[i]);
-#pragma GCC unroll 4
-        for (int v = 0; v < 4; v++) {
-            accum[v] = _mm512_fmadd_ps(input, _mm512_loadu_ps(w + (size_t)i * stride + v * 16),
-                                       accum[v]);
-        }
-    }
-#pragma GCC unroll 4
-    for (int v = 0; v < 4; v++) {
-        _mm512_storeu_ps(y + v * 16, accum[v]);
-    }
-}
 #endif
 
 void matvec_ordered(const float *x, const float *w, int in_dim, int out_dim,
@@ -163,8 +138,6 @@ void matvec_ordered(const float *x, const float *w, int in_dim, int out_dim,
 #ifdef MOE_X86
         if ((packed || width == MOE_PACK_COLS) && kernel == MOE_KERNEL_AVX2) {
             avx2_block(x, block, in_dim, stride, dest);
-        } else if ((packed || width == MOE_PACK_COLS) && kernel == MOE_KERNEL_AVX512) {
-            avx512_block(x, block, in_dim, stride, dest);
         } else
 #endif
         {

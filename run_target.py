@@ -23,15 +23,8 @@ HUGE_PAGES = POOL_MIB // 2
 PCI_ROOT = Path('/sys/bus/pci/devices')
 MOE_OPTIONS = dict(name='moe_bdev_0', backend='nvme', kernel='avx2', pipeline='matrix_fifo',
                    d_model=2048, d_ff=7168, num_experts=256, top_k=8, cache_slots=8,
-                   io_size=1048576, io_depth=16, prefetch=2, compute_threads=1, decode_threads=1,
+                   io_size=1048576, io_depth=16, compute_threads=1, decode_threads=1,
                    weight_encoding='lattice', warmup_requests=16)
-
-
-def moe_options(cache_slots):
-    options = dict(MOE_OPTIONS, cache_slots=cache_slots)
-    if cache_slots < options['top_k']:
-        options['pipeline'] = 'matrix'
-    return options
 
 
 def target_command(binary, rpc_path, bdf, huge_directory):
@@ -200,7 +193,7 @@ class Rpc:
                 return response['result']
 
 
-def publish(rpc, bdf, nsid, weights, cache_slots=None):
+def publish(rpc, bdf, nsid, weights):
     rpc.call('iobuf_set_options', small_pool_count=1024, large_pool_count=256,
              small_bufsize=8192, large_bufsize=135168)
     rpc.call('bdev_set_options', bdev_io_pool_size=4096, bdev_io_cache_size=128)
@@ -225,7 +218,7 @@ def publish(rpc, bdf, nsid, weights, cache_slots=None):
     else:
         print(f'TRIM: {base} does not support UNMAP; continuing without the recommended TRIM', flush=True)
     print(f'IMPORTING: {base}, {LAYOUT_BYTES} bytes; listener remains closed', flush=True)
-    options = moe_options(MOE_OPTIONS['cache_slots'] if cache_slots is None else cache_slots)
+    options = dict(MOE_OPTIONS)
     rpc.call('bdev_moe_create', **options, base_bdev=base, weight_dir=str(weights))
     devices = rpc.call('bdev_get_bdevs', name='moe_bdev_0')
     info = devices[0]['driver_specific']['moe'] if len(devices) == 1 else {}
@@ -235,6 +228,12 @@ def publish(rpc, bdf, nsid, weights, cache_slots=None):
         raise RuntimeError(f'MoE weight encoding differs from submission configuration: {info}')
     if info.get('cache_memory') != 'cpu':
         raise RuntimeError(f'Decoded expert cache must use CPU memory: {info}')
+    slots, retries = info.get('cache_slots'), info.get('warmup_retries')
+    expected_pipeline = 'matrix_fifo' if slots == 8 else 'matrix'
+    if (slots, retries) not in ((8, 0), (7, 1)) or info.get('pipeline') != expected_pipeline:
+        raise RuntimeError(f'Unexpected startup profile or fallback: {info}')
+    if info.get('compute_threads') != 1 or info.get('decode_threads') != 1:
+        raise RuntimeError(f'Unexpected worker configuration: {info}')
     rpc.call('nvmf_create_transport', trtype='TCP', io_unit_size=16384, max_io_size=131072,
              max_io_qpairs_per_ctrlr=128, in_capsule_data_size=16384, max_aq_depth=32,
              num_shared_buffers=128, buf_cache_size=32)
@@ -282,8 +281,6 @@ def main():
                         help='Explicit SPDK PCI driver; UIO is available for a host without IOMMU')
     parser.add_argument('--nsid', type=int, help='Physical namespace ID; default: unique namespace (exported NSID is always 1)')
     parser.add_argument('--weights', type=Path, default=Path('/tmp/moe_weights'))
-    parser.add_argument('--cache-slots', type=int, choices=range(1, 10), default=MOE_OPTIONS['cache_slots'],
-                        help='Resident expert slots; default: 8; 9 requires encoded CPU cache; fewer than 8 use matrix')
     parser.add_argument('--huge-dir', type=Path, default=Path('/mnt/moe_huge'), help='Dedicated 2MiB hugetlbfs mount')
     parser.add_argument('--allow-overwrite', action='store_true', help='Required: authorize replacing data on this namespace')
     parser.add_argument('--prepare', action='store_true', help='Bind only the selected controller and prepare 2MiB hugepages; then exit')
@@ -296,7 +293,7 @@ def main():
         print(json.dumps(dict(nvme=args.nvme, driver=args.driver, nsid=args.nsid, weights=str(args.weights),
                               huge_dir=str(args.huge_dir), memory_mode='fixed', pool_mib=POOL_MIB,
                               hugepage_kib=2048, huge_pages=HUGE_PAGES,
-                              layout_bytes=LAYOUT_BYTES, moe=moe_options(args.cache_slots),
+                              layout_bytes=LAYOUT_BYTES, moe=dict(MOE_OPTIONS),
                               nqn=NQN, address='127.0.0.1:4420'), indent=2))
         return 0
     if not args.allow_overwrite:
@@ -346,7 +343,7 @@ def main():
                     raise TimeoutError('Target RPC socket startup timed out')
                 time.sleep(0.1)
             info = publish(Rpc(rpc_path, args.startup_timeout), args.nvme, args.nsid,
-                           args.weights.resolve(), args.cache_slots)
+                           args.weights.resolve())
             print(f'READY: {NQN} 127.0.0.1:4420 nsid=1 target_pid={process.pid} '
                   f'cache_slots={info["cache_slots"]} warmup_completed={info["warmup_completed"]} '
                   f'cache_memory={info["cache_memory"]} '

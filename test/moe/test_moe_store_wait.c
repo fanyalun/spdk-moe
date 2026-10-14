@@ -13,8 +13,7 @@ static uint64_t g_low, g_high;
 static uint64_t g_ticks;
 static uint64_t g_offsets[128];
 static unsigned g_submitted;
-static uint64_t g_io_bytes = 4096, g_ready[4];
-static unsigned g_progress;
+static uint64_t g_io_bytes = 4096;
 
 uint64_t
 spdk_get_ticks(void)
@@ -72,23 +71,6 @@ done(void *arg, int status)
 {
 	g_done++;
 	g_failed += status != 0;
-}
-
-static void
-progress(void *arg, uint64_t ready_bytes)
-{
-	assert(g_progress < SPDK_COUNTOF(g_ready));
-	g_ready[g_progress++] = ready_bytes;
-}
-
-static void
-complete_index(unsigned index)
-{
-	assert(index < g_count);
-	spdk_bdev_io_completion_cb cb = g_pending[index].callback;
-	void *arg = g_pending[index].arg;
-	g_pending[index] = g_pending[--g_count];
-	cb((void *)1, true, arg);
 }
 
 static void
@@ -216,29 +198,6 @@ main(void)
 	g_starve = false;
 	wait->cb_fn(wait->cb_arg);
 	assert(g_done == before + 3 && !s.active_io && !g_count);
-	/* Publish only a contiguous prefix, while later reads remain in flight. */
-	unsigned char *large = malloc(4 * MOE_STORE_MIB);
-	assert(large);
-	s.layout.gate_bytes = s.layout.down_bytes = 4 * MOE_STORE_MIB;
-	s.layout.expert_stride = 12 * MOE_STORE_MIB;
-	s.io_size = g_io_bytes = MOE_STORE_MIB;
-	s.io_depth = 4;
-	g_submitted = 0;
-	batch[0] = (struct moe_matrix_read){
-		.expert = 0, .matrix = 0, .buffer = large, .done = done, .progress = progress,
-	};
-	before = g_done;
-	assert(!moe_store_read_batch(&s, batch, 1) && g_count == 4);
-	complete_index(0);
-	assert(g_progress == 1 && g_ready[0] == MOE_STORE_MIB && g_done == before);
-	complete_index(2);
-	assert(g_progress == 1 && g_done == before);
-	complete_index(1);
-	assert(g_progress == 2 && g_ready[1] == 3 * MOE_STORE_MIB && g_done == before);
-	complete_index(0);
-	assert(g_progress == 3 && g_ready[2] == 4 * MOE_STORE_MIB && g_done == before + 1);
-	assert(!s.active_io && !g_count);
-	free(large);
 	puts("PASS: matrix bounds/canaries/failures, ENOMEM wait/retry, out-of-order completions, error drain, removal, exactly-once callbacks");
 	return 0;
 }

@@ -7,7 +7,7 @@
 
 #define MOE_PACK_COLS 64
 
-enum moe_kernel { MOE_KERNEL_SCALAR, MOE_KERNEL_AVX2, MOE_KERNEL_AVX512 };
+enum moe_kernel { MOE_KERNEL_SCALAR, MOE_KERNEL_AVX2 };
 
 int moe_kernel_supported(enum moe_kernel kernel);
 int moe_kernel_parse(const char *name, enum moe_kernel *kernel);
