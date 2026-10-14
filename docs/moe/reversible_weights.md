@@ -119,34 +119,35 @@ MOE_TEST_TILE=1 MOE_TEST_TILE_COLS=512 MOE_TEST_ENCODING=lattice \
 
 ## SPDK 2 MiB 大页与预分配
 
-`moe_tgt` 默认使用 2 MiB HugeTLB，默认 SPDK 内存池为 1664 MiB（832 页）。
+`moe_tgt` 默认使用 2 MiB HugeTLB，默认 SPDK 内存池为 256 MiB（128 页）。
 优先验证 `--huge-dir` 指定的挂载点，否则自动寻找可读写的 2 MiB hugetlbfs。
 不会选择 1 GiB 页或静默退回普通页。未配置大页时启动失败并给出说明；
-本地普通页调试仍可显式传入 `--no-huge --no-pci -s 1664`。
+本地普通页调试仍可显式传入 `--no-huge --no-pci -s 256`。
 
 启动接入 SPDK 的 `spdk_app_opts`、`spdk_env_init` 和现有 DMA 分配接口。
 启用 DPDK `--legacy-mem` 以及仓库已有的 `MOE_FIXED_HUGEPAGES` 限额逻辑，
 在初始映射之前把 2 MiB 页数限制为指定池大小，避免先映射宿主机全部大页。
-固定池在推理时不再扩张。DPDK 初始化逐页预触碰；专家缓存和编码暂存区
-由 SPDK 分配并清零，随后执行默认 16 次完整推理预热，完成后才发布就绪。
+固定池在推理时不再扩张。DPDK 初始化逐页预触碰；编码暂存区由 SPDK
+分配，解码专家缓存使用预触碰的 CPU 内存并建议 2 MiB THP。随后执行
+默认 16 次完整推理预热，完成后才发布就绪。
 预分配失败发生在 EAL 初始化阶段，不能靠之后的降缓存槽位重试解决。
 
-1664 MiB 包含八槽位的 1344 MiB 专家缓存，池内余量为 320 MiB，
-用于 SPDK 对象池、DMA 暂存区、导入缓冲区等，不额外复制一份专家权重。
+256 MiB SPDK 池用于对象池、DMA 暂存区、导入缓冲区等；八槽位的
+1344 MiB 解码专家缓存位于 CPU 内存，两者合计 1600 MiB，不额外复制专家。
 普通堆、线程栈、计算工作区和元数据还需另算。按十进制 2 GB 总上限，
-池外余量约 243 MiB；是否足够须在真实大页环境记录完整生命周期峰值。
+其余余量约 307 MiB；是否足够须在真实大页环境记录完整生命周期峰值。
 可用 `-s` 显式调整池大小，要求正偶数 MiB；不要仅为增加余量而盲目扩大池。
-文件调试后端的专家缓存使用普通堆，不能以此配置证明缓存用了大页，
-其完整尺寸实验应沿用较小的普通页 SPDK 池。正式路径使用 AIO/NVMe 后端。
+未编码 AIO/NVMe 的专家缓存仍使用 DMA 内存，完整尺寸 raw 调试须显式
+增大 SPDK 池。编码路径的详细分配关系见 `cpu_expert_cache.md`。
 
 在目标宿主机上由管理员预留页并挂载；以下以目标 reactor 所在 node0、
 独占实验机且当前预留不足为例，已有更大预留池时无需减少它：
 
 ```sh
-# 先查看目标 NUMA 节点的 2 MiB 空闲页数；832 页应留给本次进程。
+# 先查看目标 NUMA 节点的 2 MiB 空闲页数；128 页应留给本次进程。
 cat /sys/devices/system/node/node0/hugepages/hugepages-2048kB/free_hugepages
-# 仅当当前预留少于 832 且无其他用户时执行；写入后检查实际页数与空闲页数。
-echo 832 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+# 仅当当前预留少于 128 且无其他用户时执行；写入后检查实际页数与空闲页数。
+echo 128 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
 mkdir -p /mnt/moe_hugepages_2m
 mount -t hugetlbfs -o pagesize=2M none /mnt/moe_hugepages_2m
 build/examples/moe_tgt --huge-dir /mnt/moe_hugepages_2m -c /path/to/nvme_config.json

@@ -4,6 +4,21 @@
 #include "spdk/env.h"
 #include "spdk/bdev.h"
 
+int __real_posix_memalign(void **buffer, size_t align, size_t size);
+int __wrap_posix_memalign(void **buffer, size_t align, size_t size);
+
+int
+__wrap_posix_memalign(void **buffer, size_t align, size_t size)
+{
+	static unsigned slots;
+	if (getenv("MOE_TEST_STARTUP_ALLOC_FAIL") && align == 2 * 1024 * 1024 &&
+	    size == 2 * 1024 * 1024 && ++slots == 8) {
+		puts("startup_allocation_failure_injected=1");
+		return ENOMEM;
+	}
+	return __real_posix_memalign(buffer, align, size);
+}
+
 void *__real_spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *unused, int numa_id);
 void *__wrap_spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *unused, int numa_id);
 

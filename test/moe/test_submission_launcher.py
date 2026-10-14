@@ -17,6 +17,7 @@ class FakeRpc:
     def __init__(self, completed=16, slots=8, encoding='lattice'):
         self.calls = []
         self.info = dict(warmup_completed=completed, cache_slots=slots,
+                         cache_memory='cpu',
                          weight_encoding=encoding, pipeline='matrix_fifo' if slots == 8 else 'matrix')
 
     def call(self, method, **params):
@@ -41,8 +42,8 @@ class LauncherTest(unittest.TestCase):
         self.assertIn('-A', command)
         self.assertNotIn('--no-pci', command)
         self.assertNotIn('--no-huge', command)
-        self.assertEqual(command[-2:], ['-s', '1664'])
-        self.assertEqual(TARGET.HUGE_PAGES, 832)
+        self.assertEqual(command[-2:], ['-s', '256'])
+        self.assertEqual(TARGET.HUGE_PAGES, 128)
 
     def test_fewer_slots_keep_encoding(self):
         for slots in (1, 7):
@@ -56,11 +57,14 @@ class LauncherTest(unittest.TestCase):
             info = TARGET.publish(rpc, '0000:01:00.0', None, Path('/tmp/weights'), 8)
             self.assertEqual(info['cache_slots'], actual_slots)
             methods = [method for method, _ in rpc.calls]
+            self.assertLess(methods.index('iobuf_set_options'), methods.index('framework_start_init'))
             self.assertLess(methods.index('bdev_moe_create'), methods.index('nvmf_create_transport'))
             self.assertEqual(methods[-1], 'nvmf_subsystem_add_listener')
 
     def test_invalid_warmup_or_encoding_never_listens(self):
-        for rpc in (FakeRpc(completed=15), FakeRpc(encoding='raw')):
+        wrong_memory = FakeRpc()
+        wrong_memory.info['cache_memory'] = 'dma'
+        for rpc in (FakeRpc(completed=15), FakeRpc(encoding='raw'), wrong_memory):
             with self.assertRaises(RuntimeError):
                 TARGET.publish(rpc, '0000:01:00.0', None, Path('/tmp/weights'), 8)
             self.assertFalse(any(method.startswith('nvmf_') for method, _ in rpc.calls))
@@ -76,7 +80,7 @@ class LauncherTest(unittest.TestCase):
                     patch.object(TARGET.subprocess, 'run') as run:
                 TARGET.prepare('0000:01:00.0', 0, 'vfio-pci', Path(directory))
             env = run.call_args.kwargs['env']
-            self.assertEqual(env['HUGEMEM'], '1664')
+            self.assertEqual(env['HUGEMEM'], '256')
             self.assertEqual(env['HUGEPGSZ'], '2048')
             self.assertEqual(env['PCI_ALLOWED'], '0000:01:00.0')
             self.assertNotIn('NRHUGE', env)

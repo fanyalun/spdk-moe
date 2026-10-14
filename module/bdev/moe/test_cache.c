@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdint.h>
 
 int main(void)
 {
@@ -37,10 +38,19 @@ int main(void)
 		up[expert] = data[expert][1];
 		down[expert] = data[expert][2];
 	}
-	for (capacity = 1; capacity <= 3; capacity++) {
+	for (int mode = 0; mode < 6; mode++) {
 		struct moe_cache cache;
 		const float *cached_gate, *cached_up, *cached_down;
-		assert(moe_cache_init(&cache, capacity, 2, 4, directory) == 0);
+		capacity = mode % 3 + 1;
+		assert((mode < 3 ? moe_cache_init(&cache, capacity, 2, 4, directory) :
+			moe_cache_init_cpu_buffers(&cache, capacity, 2, 4, directory, 32, 96)) == 0);
+		assert(cache.cpu_memory == (mode >= 3));
+		for (int slot = 0; mode >= 3 && slot < capacity; slot++) {
+			assert((uintptr_t)cache.entries[slot].buffer % (2 * 1024 * 1024) == 0);
+			for (int i = 0; i < 24; i++) {
+				assert(((float *)cache.entries[slot].buffer)[i] == 0.0f);
+			}
+		}
 		for (request = 0; request < 3; request++) {
 			float expected[2], actual[2] = {0}, logits[3], weights[2], output[2];
 			int indices[2];

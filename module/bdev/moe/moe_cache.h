@@ -24,6 +24,7 @@ struct moe_cache {
 	const char *weight_dir;
 	uint64_t clock, hits, misses, evictions, read_bytes;
 	size_t buffer_bytes;
+	bool cpu_memory;
 	void (*release)(void *);
 };
 
@@ -32,6 +33,8 @@ int moe_cache_init(struct moe_cache *cache, int capacity, int d_model, int d_ff,
 int moe_cache_init_buffers(struct moe_cache *cache, int capacity, int d_model, int d_ff,
 			   const char *directory, size_t gate_bytes, size_t buffer_bytes,
 			   void *(*allocate)(size_t), void (*release)(void *));
+int moe_cache_init_cpu_buffers(struct moe_cache *cache, int capacity, int d_model, int d_ff,
+			       const char *directory, size_t gate_bytes, size_t buffer_bytes);
 int moe_cache_find(struct moe_cache *cache, int expert_id);
 int moe_cache_reserve(struct moe_cache *cache, int expert_id);
 int moe_cache_load_file(struct moe_cache *cache, int slot);

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 SPDK = ROOT
 NQN = 'nqn.2024-07.io.spdk:moe_target'
 LAYOUT_BYTES = 45100302336
-POOL_MIB = 1664
+POOL_MIB = 256
 HUGE_PAGES = POOL_MIB // 2
 PCI_ROOT = Path('/sys/bus/pci/devices')
 MOE_OPTIONS = dict(name='moe_bdev_0', backend='nvme', kernel='avx2', pipeline='matrix_fifo',
@@ -201,6 +201,8 @@ class Rpc:
 
 
 def publish(rpc, bdf, nsid, weights, cache_slots=None):
+    rpc.call('iobuf_set_options', small_pool_count=1024, large_pool_count=256,
+             small_bufsize=8192, large_bufsize=135168)
     rpc.call('bdev_set_options', bdev_io_pool_size=4096, bdev_io_cache_size=128)
     rpc.call('framework_start_init')
     namespaces = rpc.call('bdev_nvme_attach_controller', name='ScoringNvme', trtype='PCIe', traddr=bdf)
@@ -231,8 +233,11 @@ def publish(rpc, bdf, nsid, weights, cache_slots=None):
         raise RuntimeError(f'MoE startup warmup incomplete: {info}')
     if info.get('weight_encoding') != options['weight_encoding']:
         raise RuntimeError(f'MoE weight encoding differs from submission configuration: {info}')
+    if info.get('cache_memory') != 'cpu':
+        raise RuntimeError(f'Decoded expert cache must use CPU memory: {info}')
     rpc.call('nvmf_create_transport', trtype='TCP', io_unit_size=16384, max_io_size=131072,
-             max_io_qpairs_per_ctrlr=128, in_capsule_data_size=16384, max_aq_depth=32)
+             max_io_qpairs_per_ctrlr=128, in_capsule_data_size=16384, max_aq_depth=32,
+             num_shared_buffers=128, buf_cache_size=32)
     rpc.call('nvmf_create_subsystem', nqn=NQN, allow_any_host=True,
              serial_number='MOE00000000000001', model_number='MoE FFN Target', max_namespaces=1)
     rpc.call('nvmf_subsystem_add_ns', nqn=NQN, namespace=dict(nsid=1, bdev_name='moe_bdev_0'))
@@ -344,6 +349,7 @@ def main():
                            args.weights.resolve(), args.cache_slots)
             print(f'READY: {NQN} 127.0.0.1:4420 nsid=1 target_pid={process.pid} '
                   f'cache_slots={info["cache_slots"]} warmup_completed={info["warmup_completed"]} '
+                  f'cache_memory={info["cache_memory"]} '
                   f'weight_encoding={info["weight_encoding"]} pipeline={info["pipeline"]}', flush=True)
             return process.wait()
         finally:

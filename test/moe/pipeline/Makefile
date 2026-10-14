@@ -7,6 +7,7 @@ APP = moe_pipeline_test
 C_SRCS = ../test_moe_pipeline.c
 C_SRCS += startup_faults.c
 LDFLAGS += -Wl,--wrap=spdk_dma_zmalloc_socket
+LDFLAGS += -Wl,--wrap=posix_memalign
 LDFLAGS += -Wl,--wrap=spdk_bdev_read
 SPDK_LIB_LIST = $(ALL_MODULES_LIST) event event_bdev
 REFERENCE_LIB ?= $(SPDK_ROOT_DIR)/../MoE-compute/build_accuracy/libmoe_reference.a

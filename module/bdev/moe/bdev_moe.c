@@ -1053,6 +1053,7 @@ bdev_moe_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint32(w, "warmup_completed", moe->warmup_done);
 	spdk_json_write_named_uint32(w, "warmup_retries", moe->warmup_retries);
 	spdk_json_write_named_int32(w, "cache_slots", moe->cache.capacity);
+	spdk_json_write_named_string(w, "cache_memory", moe->cache.cpu_memory ? "cpu" : "dma");
 	spdk_json_write_named_int32(w, "compute_threads", moe->compute_threads);
 	spdk_json_write_named_bool(w, "prefetch_ignored", moe->matrix_fifo);
 	spdk_json_write_named_string(w, "weight_encoding", moe->store.lattice ? "lattice" : "raw");
@@ -1335,21 +1336,34 @@ store_ready(void *arg, int status)
 	if (!status) {
 		moe->router = moe->store.router;
 		int slots = moe->cache.capacity;
-		status = moe_cache_init_buffers(&moe->cache, moe->cache.capacity,
-						moe->ws.d_model, moe->ws.d_ff, moe->directory,
-						moe->store.layout.gate_bytes,
-						moe->store.layout.expert_stride, dma_allocate, spdk_dma_free);
-		if (status == -ENOMEM && !moe->warmup_retries && slots > 1) {
+		for (int attempt = 0; attempt < 2; attempt++) {
+			if (moe->store.lattice) {
+				status = moe_cache_init_cpu_buffers(&moe->cache, slots - attempt,
+								   moe->ws.d_model, moe->ws.d_ff, moe->directory,
+								   moe->store.layout.gate_bytes,
+								   moe->store.layout.expert_stride);
+			} else {
+				status = moe_cache_init_buffers(&moe->cache, slots - attempt,
+							       moe->ws.d_model, moe->ws.d_ff, moe->directory,
+							       moe->store.layout.gate_bytes,
+							       moe->store.layout.expert_stride,
+							       dma_allocate, spdk_dma_free);
+			}
+			if (status != -ENOMEM || attempt || moe->warmup_retries || slots <= 1) {
+				break;
+			}
 			startup_reduce_cache(moe, slots, status);
-			status = moe_cache_init_buffers(&moe->cache, slots - 1,
-						       moe->ws.d_model, moe->ws.d_ff, moe->directory,
-						       moe->store.layout.gate_bytes,
-						       moe->store.layout.expert_stride, dma_allocate, spdk_dma_free);
 		}
 		if (status) {
-			SPDK_ERRLOG("DMA cache allocation failed: slots=%d slot_bytes=%" PRIu64
-				    " pool_budget=1536MiB; pool is not expanded\n",
-				    slots, moe->store.layout.expert_stride);
+			SPDK_ERRLOG("Expert cache allocation failed: memory=%s slots=%d slot_bytes=%" PRIu64
+				    " status=%d; pool is not expanded\n",
+				    moe->store.lattice ? "cpu" : "dma", slots - moe->warmup_retries,
+				    moe->store.layout.expert_stride, status);
+		} else {
+			SPDK_NOTICELOG("Expert cache prefaulted: memory=%s slots=%d bytes=%" PRIu64 "\n",
+				       moe->cache.cpu_memory ? "cpu (2MiB THP advised)" : "dma",
+				       moe->cache.capacity,
+				       moe->cache.capacity * moe->store.layout.expert_stride);
 		}
 	}
 	if (!status) {
@@ -1417,7 +1431,7 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	uint64_t cache_bytes = layout.expert_stride * o->cache_slots;
 	if (cache_bytes + 128 * MOE_STORE_MIB + MOE_STORE_MIB > 1536 * MOE_STORE_MIB) {
 		SPDK_ERRLOG("MoE memory admission failed: cache=%" PRIu64
-			    " reserve=129MiB DMA_budget=1536MiB\n", cache_bytes);
+			    " reserve=129MiB cache_budget=1536MiB\n", cache_bytes);
 		return -ENOMEM;
 	}
 	struct moe_bdev *moe = calloc(1, sizeof(*moe));

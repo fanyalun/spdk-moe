@@ -5,7 +5,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include "moe_cache.h"
+
+static void *
+cpu_allocate(size_t bytes)
+{
+	const size_t page = 2 * 1024 * 1024;
+	void *buffer;
+
+	if (bytes > SIZE_MAX - (page - 1)) {
+		return NULL;
+	}
+	size_t length = (bytes + page - 1) / page * page;
+	if (posix_memalign(&buffer, page, length)) {
+		return NULL;
+	}
+	// THP is advisory; ordinary pages are valid for CPU-only decoded weights.
+	(void)madvise(buffer, length, MADV_HUGEPAGE);
+	return buffer;
+}
 
 int
 moe_cache_init_buffers(struct moe_cache *c, int capacity, int d, int h,
@@ -42,6 +61,18 @@ moe_cache_init_buffers(struct moe_cache *c, int capacity, int d, int h,
 		e->expert_id = -1;
 	}
 	return 0;
+}
+
+int
+moe_cache_init_cpu_buffers(struct moe_cache *c, int capacity, int d, int h,
+			   const char *directory, size_t gate_bytes, size_t buffer_bytes)
+{
+	int rc = moe_cache_init_buffers(c, capacity, d, h, directory, gate_bytes, buffer_bytes,
+					cpu_allocate, free);
+	if (!rc) {
+		c->cpu_memory = true;
+	}
+	return rc;
 }
 
 int
