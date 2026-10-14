@@ -282,8 +282,8 @@ def main():
                         help='Explicit SPDK PCI driver; UIO is available for a host without IOMMU')
     parser.add_argument('--nsid', type=int, help='Physical namespace ID; default: unique namespace (exported NSID is always 1)')
     parser.add_argument('--weights', type=Path, default=Path('/tmp/moe_weights'))
-    parser.add_argument('--cache-slots', type=int, choices=range(1, 9), default=MOE_OPTIONS['cache_slots'],
-                        help='Resident expert slots; default: 8; fewer than 8 use the matrix pipeline')
+    parser.add_argument('--cache-slots', type=int, choices=range(1, 10), default=MOE_OPTIONS['cache_slots'],
+                        help='Resident expert slots; default: 8; 9 requires encoded CPU cache; fewer than 8 use matrix')
     parser.add_argument('--huge-dir', type=Path, default=Path('/mnt/moe_huge'), help='Dedicated 2MiB hugetlbfs mount')
     parser.add_argument('--allow-overwrite', action='store_true', help='Required: authorize replacing data on this namespace')
     parser.add_argument('--prepare', action='store_true', help='Bind only the selected controller and prepare 2MiB hugepages; then exit')

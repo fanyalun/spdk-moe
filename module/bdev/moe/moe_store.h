@@ -11,7 +11,7 @@
 #include "moe_codec.h"
 
 #define MOE_STORE_MIB (1024ULL * 1024)
-#define MOE_STORE_MAX_IO 16
+#define MOE_STORE_MAX_IO 64
 #define MOE_STORE_MAX_READS 24
 
 struct moe_layout {

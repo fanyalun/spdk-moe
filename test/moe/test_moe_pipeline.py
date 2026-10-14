@@ -115,6 +115,11 @@ def main():
     encoding = os.environ.get('MOE_TEST_ENCODING', 'raw')
     warmup = int(os.environ.get('MOE_TEST_STARTUP_WARMUP', '0'))
     selected_case = os.environ.get('MOE_TEST_CASE')
+    capacity_override = os.environ.get('MOE_TEST_CACHE_SLOTS')
+    depth_override = os.environ.get('MOE_TEST_IO_DEPTH')
+    if capacity_override is not None or depth_override is not None:
+        if selected_case != '' or not (os.environ.get('MOE_TEST_FIFO') or os.environ.get('MOE_TEST_TILE')):
+            raise ValueError('capacity/depth overrides require a selected normal FIFO case')
     if os.environ.get('MOE_TEST_FIFO') or os.environ.get('MOE_TEST_TILE'):
         cases = [('aio', 8, fault) for fault in ('', 'threads2', 'threads4',
                  'large_chunk', 'truncate', 'remove', 'slow', 'shutdown',
@@ -135,6 +140,8 @@ def main():
                      case[2] in ('warmup_retry', 'warmup_alloc_retry') else
                      ['matrix'] if case[2] == 'short_source' else
                      ['expert', 'matrix'] if case[0] == 'aio' else ['expert'])]:
+        if capacity_override is not None:
+            slots = int(capacity_override)
         label = f'{backend}_{slots}_{fault or "normal"}_{pipeline}'
         image = artifacts / f'{label}.bin'
         if backend == 'aio':
@@ -148,6 +155,8 @@ def main():
         if warmup != 16 and fault != 'warmup_failure' and not startup_retry:
             params['warmup_requests'] = warmup
         params['weight_encoding'] = encoding
+        if depth_override is not None:
+            params['io_depth'] = int(depth_override)
         if pipeline == 'tile_fifo':
             params['compute_tile_cols'] = int(os.environ.get('MOE_TEST_TILE_COLS', '128'))
         if os.environ.get('MOE_TEST_DEFAULTS') and backend == 'aio' and slots == 8 and not fault:

@@ -1387,7 +1387,7 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	int rc;
 
 	if (!o || !o->name || !o->backend || !o->weight_dir || !done ||
-	    o->cache_slots < 1 || o->cache_slots > 8 || o->top_k < 1 || o->top_k > MOE_REQUEST_MAX_K ||
+	    o->cache_slots < 1 || o->cache_slots > 9 || o->top_k < 1 || o->top_k > MOE_REQUEST_MAX_K ||
 	    o->top_k > o->num_experts || o->d_model < 128 || o->d_model % 128 ||
 	    o->prefetch < 1 || o->prefetch > 4 || o->warmup_requests > 64 ||
 	    (o->compute_threads != 1 && o->compute_threads != 2 && o->compute_threads != 4) ||
@@ -1401,6 +1401,9 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	bool matrix = fifo || (o->pipeline && !strcmp(o->pipeline, "matrix"));
 	bool lattice = o->weight_encoding ? !strcmp(o->weight_encoding, "lattice") :
 		       fifo && o->io_size == MOE_STORE_MIB;
+	if (o->cache_slots > 8 && !lattice) {
+		return -EINVAL;
+	}
 	if ((o->weight_encoding && strcmp(o->weight_encoding, "raw") && !lattice) ||
 	    (lattice && (!matrix || o->io_size != MOE_STORE_MIB))) {
 		return -EINVAL;
@@ -1429,9 +1432,11 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 		return rc;
 	}
 	uint64_t cache_bytes = layout.expert_stride * o->cache_slots;
-	if (cache_bytes + 128 * MOE_STORE_MIB + MOE_STORE_MIB > 1536 * MOE_STORE_MIB) {
+	uint64_t cache_budget = lattice ? UINT64_C(2000000000) - 256 * MOE_STORE_MIB :
+			       1536 * MOE_STORE_MIB;
+	if (cache_bytes + 129 * MOE_STORE_MIB > cache_budget) {
 		SPDK_ERRLOG("MoE memory admission failed: cache=%" PRIu64
-			    " reserve=129MiB cache_budget=1536MiB\n", cache_bytes);
+			    " reserve=129MiB cache_budget=%" PRIu64 " bytes\n", cache_bytes, cache_budget);
 		return -ENOMEM;
 	}
 	struct moe_bdev *moe = calloc(1, sizeof(*moe));
