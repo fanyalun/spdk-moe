@@ -28,7 +28,7 @@ moe_trace_event(const char *operation, int expert, int stage, uint64_t bytes,
 		description = "CPU submit SPDK read";
 		color = 0xff136084;
 	} else if (!strcmp(operation, "DECODE")) {
-		description = "CPU Decode + checksum + FP32 writeback";
+		description = "CPU Decode + FP32 writeback";
 		color = 0xffe49331;
 	} else if (!strcmp(operation, "COMPUTE")) {
 		description = "CPU expert compute";

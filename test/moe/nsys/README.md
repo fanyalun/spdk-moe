@@ -104,7 +104,8 @@ does not contain input RMSNorm or LayerNorm.
    **CPU Compute / Router + Experts + Aggregate**, then expand its **NVTX** row.
    Actual CPU stages use thread-local push/pop ranges and nested leaf stages.
 2. Expand **CPU IO + Decode / SPDK owner**, then its **NVTX** row. Orange ranges
-   are `Expert ID / Gate|Up|Down / CPU Decode + checksum + FP32 writeback`.
+   are `Expert ID / Gate|Up|Down / CPU Decode + FP32 writeback`.
+   Runtime payload checksums have been removed; historical captures retain their original labels.
    Dark blue ranges are the CPU's `SPDK read` submission, not the device transfer.
 3. Expand the process-level NVTX/Annotations row for async **Request**,
    blue **I/O outstanding** and red **Pipeline wait** ranges. Their durations

@@ -199,7 +199,7 @@ moe_codec_decode(const void *input, size_t bytes, float *output,
 	}
 	uint64_t required = b->bits < 32 ? ((uint64_t)b->words * b->bits + 7) / 8 :
 			    (uint64_t)b->words * 4;
-	if (required != b->bytes || checksum(input, b->bytes) != b->checksum) {
+	if (required != b->bytes) {
 		return -EINVAL;
 	}
 	if (b->bits == 32) {

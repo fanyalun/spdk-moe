@@ -17,10 +17,18 @@ check(const float *data, unsigned count, unsigned expected)
 	assert(!moe_codec_decode(tight, block.bytes + 16, restored, &block));
 	assert(!memcmp(data, restored, count * 4));
 	assert(moe_codec_decode(tight, block.bytes + 15, restored, &block) == -EINVAL);
-	if (block.bytes) {
-		tight[block.bytes / 2] ^= 1;
-		assert(moe_codec_decode(tight, block.bytes + 16, restored, &block) == -EINVAL);
-	}
+	block.checksum ^= UINT32_MAX;
+	assert(!moe_codec_decode(tight, block.bytes + 16, restored, &block));
+	assert(!memcmp(data, restored, count * 4));
+	struct moe_codec_block invalid = block;
+	invalid.bytes++;
+	assert(moe_codec_decode(encoded, count * 4 + 16, restored, &invalid) == -EINVAL);
+	invalid = block;
+	invalid.bits = 33;
+	assert(moe_codec_decode(tight, block.bytes + 16, restored, &invalid) == -EINVAL);
+	invalid = block;
+	invalid.scale = 31;
+	assert(moe_codec_decode(tight, block.bytes + 16, restored, &invalid) == -EINVAL);
 	free(tight);
 	free(encoded);
 	free(restored);
@@ -56,6 +64,7 @@ main(void)
 		}
 		check(values, (sizeof(values) / sizeof(values[0])), 32);
 	}
-	puts("PASS: widths, tight guards, tails, raw fallback, NaN/Inf/signed-zero bits, corruption");
+	puts("PASS: widths, tight guards, tails, raw fallback, NaN/Inf/signed-zero bits, "
+	     "ignored checksum, metadata guards");
 	return 0;
 }
