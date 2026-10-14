@@ -20,6 +20,8 @@
 
 使用系统现有LZ4/Zstd共享库、C编译器及Python标准库，无需numpy或Python压缩扩展。增量构建只生成实验共享库。
 
+生产lattice及实验split/split_fast的C算法本身无新增压缩库依赖；本离线Python驱动启动时始终加载 `libzstd.so.1`、`liblz4.so.1`，即使只选择baseline和split_fast也需要两库。Ubuntu运行库包为 `libzstd1`、`liblz4-1`，此ctypes驱动无需相应dev包。运行前可用 `ctypes.CDLL('libzstd.so.1')` 及 `ctypes.CDLL('liblz4.so.1')` 检查。正式提交依赖及安装命令以作品管理仓库 `submission/README.md` 为准；后续若将外部codec接入target，须同步更新该README并重验干净环境构建。
+
 ```sh
 cc -D_GNU_SOURCE -O3 -fno-fast-math -g -fPIC -shared -Iinclude \
   test/moe/research_codec_variants.c -lm -o /tmp/lib_codec_variants.so
