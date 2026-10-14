@@ -35,6 +35,7 @@ static const struct spdk_json_object_decoder create_decoders[] = {
 	DECODER(prefetch, spdk_json_decode_uint32, true),
 	DECODER(compute_cpu, spdk_json_decode_int32, true),
 	DECODER(compute_threads, spdk_json_decode_int32, true),
+	DECODER(decode_threads, spdk_json_decode_uint32, true),
 };
 
 static void

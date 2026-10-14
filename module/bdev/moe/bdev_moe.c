@@ -60,7 +60,8 @@ struct moe_bdev {
 	bool ever_requested;
 	unsigned prefetch;
 	int compute_cpu;
-	int compute_threads, extra_busy, worker_cpus[4];
+	int compute_threads, extra_busy, worker_cpus[4 + MOE_STORE_MAX_DECODE_THREADS];
+	unsigned decode_threads;
 	struct moe_expert_worker extra[3];
 	pthread_t worker;
 	pthread_mutex_t mutex;
@@ -180,11 +181,15 @@ request_finish(struct moe_bdev *moe)
 			",\"io_busy_ticks_total\":%" PRIu64 ",\"io_depth_ticks_total\":%" PRIu64
 			",\"io_pending_idle_ticks_total\":%" PRIu64
 			",\"decoded_bytes_total\":%" PRIu64 ",\"decode_ticks_total\":%" PRIu64
-			",\"tile_jobs\":%u,\"compute_tile_cols\":%u}\n",
+			",\"tile_jobs\":%u,\"compute_tile_cols\":%u"
+			",\"decode_threads\":%u,\"decode_peak\":%u,\"decode_pending\":%u"
+			",\"codec_buffer_slots\":%u}\n",
 			first ? first - r->start : 0, moe->store.submit_count,
 			moe->store.resource_wait_count, moe->store.busy_ticks,
 			moe->store.depth_ticks, moe->store.pending_idle_ticks,
-			moe->store.decoded_bytes, moe->store.decode_ticks, r->tile_jobs, moe->compute_tile_cols);
+			moe->store.decoded_bytes, moe->store.decode_ticks, r->tile_jobs, moe->compute_tile_cols,
+			moe->store.decode_threads, moe->store.decode_peak,
+			moe->store.decode_pending, moe->store.op_count);
 	}
 	if (r->wait_trace) {
 		moe_trace_end(r->wait_trace);
@@ -1055,6 +1060,7 @@ bdev_moe_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_int32(w, "cache_slots", moe->cache.capacity);
 	spdk_json_write_named_string(w, "cache_memory", moe->cache.cpu_memory ? "cpu" : "dma");
 	spdk_json_write_named_int32(w, "compute_threads", moe->compute_threads);
+	spdk_json_write_named_uint32(w, "decode_threads", moe->store.decode_threads);
 	spdk_json_write_named_bool(w, "prefetch_ignored", moe->matrix_fifo);
 	spdk_json_write_named_string(w, "weight_encoding", moe->store.lattice ? "lattice" : "raw");
 	spdk_json_write_object_end(w);
@@ -1093,6 +1099,7 @@ bdev_moe_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w
 	spdk_json_write_named_int32(w, "top_k", moe->ws.top_k);
 	spdk_json_write_named_int32(w, "cache_slots", moe->cache.capacity);
 	spdk_json_write_named_int32(w, "compute_threads", moe->compute_threads);
+	spdk_json_write_named_uint32(w, "decode_threads", moe->store.decode_threads);
 	spdk_json_write_named_int32(w, "compute_cpu", moe->compute_cpu);
 	spdk_json_write_named_uint32(w, "prefetch", moe->prefetch);
 	spdk_json_write_object_end(w);
@@ -1231,6 +1238,17 @@ start_device(struct moe_bdev *moe)
 		}
 		worker->started = true;
 	}
+	for (unsigned i = 0; i < moe->store.decode_threads; i++) {
+		struct moe_decode_worker *worker = &moe->store.decoders[i];
+		worker->store = &moe->store;
+		worker->index = i;
+		rc = start_worker(moe, &worker->thread, moe_store_decode_worker,
+				  worker, moe->compute_threads + i);
+		if (rc) {
+			return rc;
+		}
+		moe->store.decode_started++;
+	}
 	spdk_thread_send_msg(moe->owner, warmup_next, moe);
 	return 0;
 }
@@ -1367,6 +1385,9 @@ store_ready(void *arg, int status)
 		}
 	}
 	if (!status) {
+		status = moe_store_set_decode_threads(&moe->store, moe->decode_threads);
+	}
+	if (!status) {
 		status = start_device(moe);
 		if (!status) {
 			return;
@@ -1390,6 +1411,7 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	    o->cache_slots < 1 || o->cache_slots > 9 || o->top_k < 1 || o->top_k > MOE_REQUEST_MAX_K ||
 	    o->top_k > o->num_experts || o->d_model < 128 || o->d_model % 128 ||
 	    o->prefetch < 1 || o->prefetch > 4 || o->warmup_requests > 64 ||
+	    o->decode_threads > MOE_STORE_MAX_DECODE_THREADS ||
 	    (o->compute_threads != 1 && o->compute_threads != 2 && o->compute_threads != 4) ||
 	    moe_kernel_parse(o->kernel, &kernel)) {
 		return -EINVAL;
@@ -1401,6 +1423,9 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	bool matrix = fifo || (o->pipeline && !strcmp(o->pipeline, "matrix"));
 	bool lattice = o->weight_encoding ? !strcmp(o->weight_encoding, "lattice") :
 		       fifo && o->io_size == MOE_STORE_MIB;
+	if (o->decode_threads && !lattice) {
+		return -EINVAL;
+	}
 	if (o->cache_slots > 8 && !lattice) {
 		return -EINVAL;
 	}
@@ -1475,6 +1500,7 @@ bdev_moe_create_async(const struct moe_create_opts *o, moe_create_done done, voi
 	moe->prefetch = o->prefetch;
 	moe->compute_cpu = o->compute_cpu;
 	moe->compute_threads = o->compute_threads;
+	moe->decode_threads = o->decode_threads;
 	moe->bdev.product_name = "MoE FP32 offload";
 	moe->bdev.blocklen = (uint32_t)o->d_model * sizeof(float);
 	moe->bdev.phys_blocklen = moe->bdev.blocklen;

@@ -349,6 +349,8 @@ moe_store_open(struct moe_store *s, const char *base, const char *directory,
 	s->owner = spdk_get_thread();
 	pthread_mutex_init(&s->mutex, NULL);
 	pthread_cond_init(&s->condition, NULL);
+	pthread_mutex_init(&s->decode_mutex, NULL);
+	pthread_cond_init(&s->decode_condition, NULL);
 	s->ready = ready;
 	s->require_direct_source = strict_nvme;
 	s->ready_arg = arg;
@@ -404,6 +406,7 @@ moe_store_open(struct moe_store *s, const char *base, const char *directory,
 	}
 	s->io_size = io_size;
 	s->io_depth = io_depth;
+	s->op_count = io_depth;
 	if (lattice) {
 		for (unsigned i = 0; i < io_depth; i++) {
 			s->ops[i].codec_buffer = spdk_dma_zmalloc(MOE_STORE_MIB + 4096, 4096, NULL);
@@ -428,7 +431,7 @@ fail:
 }
 
 static void
-read_finish_op(struct moe_store_op *op, int status)
+read_finish_io(struct moe_store_op *op, int status)
 {
 	struct moe_store_read *r = op->read;
 	struct moe_store *s = r->store;
@@ -438,7 +441,22 @@ read_finish_op(struct moe_store_op *op, int status)
 		if (!status) {
 			s->read_bytes += op->length;
 		}
+		op->submitted = false;
 	}
+	if (op->io_pending) {
+		s->pending_io--;
+		op->io_pending = false;
+	}
+	store_meter(s);
+}
+
+static void
+read_finish_op(struct moe_store_op *op, int status)
+{
+	struct moe_store_read *r = op->read;
+	struct moe_store *s = r->store;
+
+	read_finish_io(op, status);
 	if (status) {
 		r->status = status;
 		if (s->cancel_batch_on_error) {
@@ -455,18 +473,13 @@ read_finish_op(struct moe_store_op *op, int status)
 	store_meter(s);
 }
 
-static void
-read_complete(struct spdk_bdev_io *io, bool success, void *arg)
+static int
+decode_op(struct moe_store_op *op)
 {
-	struct moe_store_op *op = arg;
 	struct moe_store_read *r = op->read;
 	struct moe_store *s = r->store;
-	uint64_t offset = op->offset;
-
-	moe_trace_end(op->trace_id);
-	spdk_bdev_free_io(io);
-	int status = success ? 0 : -EIO;
-	if (!status && op->codec) {
+	int status = 0;
+	if (op->codec) {
 		uint64_t relative = op->read->offset + op->offset - s->layout.expert_offset;
 		moe_trace_push("DECODE", relative / s->layout.expert_stride,
 					       (relative % s->layout.expert_stride) / s->layout.gate_bytes,
@@ -475,13 +488,30 @@ read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 		memset((char *)op->codec_buffer + op->codec->bytes, 0, 16);
 		status = moe_codec_decode(op->codec_buffer, MOE_STORE_MIB + 4096,
 					  (float *)((char *)op->read->buffer + op->offset), op->codec);
+		op->decode_ticks = s->diagnostics ? spdk_get_ticks() - start : 0;
+		moe_trace_pop();
+	}
+	return status;
+}
+
+static void
+read_decoded(void *arg)
+{
+	struct moe_store_op *op = arg;
+	struct moe_store_read *r = op->read;
+	struct moe_store *s = r->store;
+	uint64_t offset = op->offset;
+	int status = op->decode_status;
+
+	if (op->decoding) {
+		s->decode_pending--;
+		op->decoding = false;
+	}
+	if (op->codec) {
 		if (!status) {
 			s->decoded_bytes += (uint64_t)op->codec->words * 4;
 		}
-		if (s->diagnostics) {
-			s->decode_ticks += spdk_get_ticks() - start;
-		}
-		moe_trace_pop();
+		s->decode_ticks += op->decode_ticks;
 	}
 	read_finish_op(op, status);
 	if (!status && !r->status && r->progress) {
@@ -496,6 +526,85 @@ read_complete(struct spdk_bdev_io *io, bool success, void *arg)
 		}
 	}
 	store_pump(s);
+}
+
+void *
+moe_store_decode_worker(void *arg)
+{
+	struct moe_decode_worker *worker = arg;
+	struct moe_store *s = worker->store;
+	char name[64];
+
+	snprintf(name, sizeof(name), "CPU Decode worker %u", worker->index);
+	moe_trace_name_thread(name);
+	for (;;) {
+		pthread_mutex_lock(&s->decode_mutex);
+		while (!s->decode_count && !s->decode_stop) {
+			pthread_cond_wait(&s->decode_condition, &s->decode_mutex);
+		}
+		if (s->decode_stop) {
+			pthread_mutex_unlock(&s->decode_mutex);
+			break;
+		}
+		struct moe_store_op *op = s->decode_queue[s->decode_head];
+		s->decode_head = (s->decode_head + 1) % s->op_count;
+		s->decode_count--;
+		pthread_mutex_unlock(&s->decode_mutex);
+		op->decode_status = decode_op(op);
+		int rc = spdk_thread_send_msg(s->owner, read_decoded, op);
+		if (rc) {
+			SPDK_ERRLOG("Cannot deliver decode completion to owner: %d\n", rc);
+			abort();
+		}
+	}
+	return NULL;
+}
+
+int
+moe_store_set_decode_threads(struct moe_store *s, unsigned count)
+{
+	if (count > MOE_STORE_MAX_DECODE_THREADS || (count && !s->lattice) || s->decode_started) {
+		return -EINVAL;
+	}
+	if (count) {
+		for (unsigned i = s->io_depth; i < 2 * s->io_depth; i++) {
+			s->ops[i].codec_buffer = spdk_dma_zmalloc(MOE_STORE_MIB + 4096, 4096, NULL);
+			if (!s->ops[i].codec_buffer) {
+				return -ENOMEM;
+			}
+		}
+		s->op_count = 2 * s->io_depth;
+	}
+	s->decode_threads = count;
+	return 0;
+}
+
+static void
+read_complete(struct spdk_bdev_io *io, bool success, void *arg)
+{
+	struct moe_store_op *op = arg;
+	struct moe_store *s = op->read->store;
+
+	moe_trace_end(op->trace_id);
+	spdk_bdev_free_io(io);
+	read_finish_io(op, success ? 0 : -EIO);
+	if (success && op->codec && s->decode_threads) {
+		op->decoding = true;
+		s->decode_pending++;
+		s->decode_peak = spdk_max(s->decode_peak, s->decode_pending);
+		pthread_mutex_lock(&s->decode_mutex);
+		assert(s->decode_count < s->op_count);
+		s->decode_queue[s->decode_tail] = op;
+		s->decode_tail = (s->decode_tail + 1) % s->op_count;
+		s->decode_count++;
+		pthread_cond_signal(&s->decode_condition);
+		pthread_mutex_unlock(&s->decode_mutex);
+		store_pump(s);
+		return;
+	}
+	op->decode_ticks = 0;
+	op->decode_status = success ? decode_op(op) : -EIO;
+	read_decoded(op);
 }
 
 static void
@@ -562,7 +671,9 @@ store_pump(struct moe_store *s)
 		if (atomic_load(&s->removed)) {
 			r->status = -ENODEV;
 		}
-		for (unsigned i = 0; !r->status && r->next < r->length && i < s->io_depth; i++) {
+		for (unsigned i = 0; !r->status && r->next < r->length &&
+		     s->pending_io < s->io_depth &&
+		     i < (s->decode_threads ? s->op_count : s->io_depth); i++) {
 			struct moe_store_op *op = &s->ops[i];
 			if (op->read) {
 				continue;
@@ -584,6 +695,8 @@ store_pump(struct moe_store *s)
 						  align_up(op->codec->bytes, block_size));
 			}
 			r->outstanding++;
+			op->io_pending = true;
+			s->pending_io++;
 			read_submit(op);
 		}
 		if ((r->status || r->next == r->length) && !r->outstanding) {
@@ -711,6 +824,13 @@ moe_store_close(struct moe_store *s)
 	for (unsigned i = 0; i < MOE_STORE_MAX_READS; i++) {
 		assert(!s->reads[i].active);
 	}
+	pthread_mutex_lock(&s->decode_mutex);
+	s->decode_stop = true;
+	pthread_cond_broadcast(&s->decode_condition);
+	pthread_mutex_unlock(&s->decode_mutex);
+	for (unsigned i = 0; i < s->decode_started; i++) {
+		pthread_join(s->decoders[i].thread, NULL);
+	}
 	if (s->channel) {
 		spdk_put_io_channel(s->channel);
 	}
@@ -718,7 +838,7 @@ moe_store_close(struct moe_store *s)
 		spdk_bdev_close(s->desc);
 	}
 	spdk_dma_free(s->import_buffer);
-	for (unsigned i = 0; i < MOE_STORE_MAX_IO; i++) {
+	for (unsigned i = 0; i < MOE_STORE_MAX_OPS; i++) {
 		spdk_dma_free(s->ops[i].codec_buffer);
 	}
 	free(s->codec_blocks);
@@ -727,5 +847,7 @@ moe_store_close(struct moe_store *s)
 	free(s->router);
 	pthread_mutex_destroy(&s->mutex);
 	pthread_cond_destroy(&s->condition);
+	pthread_mutex_destroy(&s->decode_mutex);
+	pthread_cond_destroy(&s->decode_condition);
 	memset(s, 0, sizeof(*s));
 }

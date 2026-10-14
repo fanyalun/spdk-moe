@@ -23,7 +23,7 @@ HUGE_PAGES = POOL_MIB // 2
 PCI_ROOT = Path('/sys/bus/pci/devices')
 MOE_OPTIONS = dict(name='moe_bdev_0', backend='nvme', kernel='avx2', pipeline='matrix_fifo',
                    d_model=2048, d_ff=7168, num_experts=256, top_k=8, cache_slots=8,
-                   io_size=1048576, io_depth=4, prefetch=2, compute_threads=1,
+                   io_size=1048576, io_depth=16, prefetch=2, compute_threads=1, decode_threads=2,
                    weight_encoding='lattice', warmup_requests=16)
 
 

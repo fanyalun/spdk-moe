@@ -155,6 +155,8 @@ def main():
         if warmup != 16 and fault != 'warmup_failure' and not startup_retry:
             params['warmup_requests'] = warmup
         params['weight_encoding'] = encoding
+        if os.environ.get('MOE_TEST_DECODE_THREADS') is not None:
+            params['decode_threads'] = int(os.environ['MOE_TEST_DECODE_THREADS'])
         if depth_override is not None:
             params['io_depth'] = int(depth_override)
         if pipeline == 'tile_fifo':

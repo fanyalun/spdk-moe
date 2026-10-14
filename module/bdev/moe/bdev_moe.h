@@ -13,6 +13,7 @@ struct moe_create_opts {
 	unsigned io_size, io_depth, prefetch;
 	int compute_cpu;
 	int compute_threads;
+	unsigned decode_threads;
 	unsigned compute_tile_cols;
 	unsigned warmup_requests;
 };

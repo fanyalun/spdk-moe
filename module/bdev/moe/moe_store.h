@@ -13,6 +13,8 @@
 #define MOE_STORE_MIB (1024ULL * 1024)
 #define MOE_STORE_MAX_IO 64
 #define MOE_STORE_MAX_READS 24
+#define MOE_STORE_MAX_DECODE_THREADS 4
+#define MOE_STORE_MAX_OPS (2 * MOE_STORE_MAX_IO)
 
 struct moe_layout {
 	uint64_t magic;
@@ -56,8 +58,18 @@ struct moe_store_op {
 	uint64_t offset, length;
 	struct spdk_bdev_io_wait_entry wait;
 	bool submitted;
+	bool io_pending;
+	bool decoding;
+	int decode_status;
+	uint64_t decode_ticks;
 	void *codec_buffer;
 	struct moe_codec_block *codec;
+};
+
+struct moe_decode_worker {
+	struct moe_store *store;
+	pthread_t thread;
+	unsigned index;
 };
 
 struct moe_store {
@@ -68,6 +80,15 @@ struct moe_store {
 	char *directory;
 	float *router;
 	unsigned io_size, io_depth, active_io, peak_io;
+	unsigned pending_io, op_count;
+	unsigned decode_threads, decode_started;
+	unsigned decode_pending, decode_peak;
+	struct moe_decode_worker decoders[MOE_STORE_MAX_DECODE_THREADS];
+	pthread_mutex_t decode_mutex;
+	pthread_cond_t decode_condition;
+	struct moe_store_op *decode_queue[MOE_STORE_MAX_OPS];
+	unsigned decode_head, decode_tail, decode_count;
+	bool decode_stop;
 	uint64_t read_bytes;
 	uint64_t submit_count, resource_wait_count;
 	uint64_t meter_ticks, busy_ticks, depth_ticks, pending_idle_ticks;
@@ -85,7 +106,7 @@ struct moe_store {
 	void (*removed_cb)(void *);
 	void *removed_arg;
 	struct moe_store_read reads[MOE_STORE_MAX_READS];
-	struct moe_store_op ops[MOE_STORE_MAX_IO];
+	struct moe_store_op ops[MOE_STORE_MAX_OPS];
 	pthread_t importer;
 	pthread_mutex_t mutex;
 	pthread_cond_t condition;
@@ -103,6 +124,8 @@ int moe_layout_init(struct moe_layout *layout, int d, int h, int experts, uint32
 int moe_store_open(struct moe_store *store, const char *base, const char *directory,
 		   int d, int h, int experts, bool strict_nvme, unsigned io_size,
 		   unsigned io_depth, bool lattice, moe_store_done ready, void *arg);
+int moe_store_set_decode_threads(struct moe_store *store, unsigned count);
+void *moe_store_decode_worker(void *arg);
 int moe_store_read_expert(struct moe_store *store, int expert, void *buffer,
 			  moe_store_done done, void *arg);
 int moe_store_read_matrix(struct moe_store *store, int expert, unsigned matrix,
